@@ -11,25 +11,24 @@
 
 Aurora is a Minecraft 1.21.4 fabric injection client with a external gui.
 
-## What it does
-
-- its just a pvp client/cheat
-
 ## Modules
 
+- Reach
 - AimAssist
 - SilentAura
+- TargetRing
 - TriggerBot
-- Reach
-- ESP
-- Trail
 - JumpReset
 - NoJumpDelay
 - HitSwap
-- CrystalComboController
+- Trail
+- Trajectories
+- ESP
+- Tracers
+- Fullbright
+- AutoTool
+- FastPlace
 - TextGui
-
-And more to come
 
 ## Configuration
 
@@ -43,4 +42,3 @@ the operating system and how Minecraft was launched:
 | Windows | `%APPDATA%\Aurora\config.properties` |
 | Flatpak launcher | `~/.var/app/<launcher-app-id>/config/aurora/config.properties` |
 | Prismlauncher Flatpak | `~/.var/app/org.prismlauncher.PrismLauncher/config/aurora/config.properties` |
-
