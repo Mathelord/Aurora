@@ -1,0 +1,125 @@
+plugins {
+    id "java"
+    id "application"
+    id "com.gradleup.shadow" version "9.4.2"
+}
+
+group = "dev.aurora"
+version = "0.1.0"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+application {
+    mainClass = "dev.aurora.injector.AuroraLauncher"
+    applicationDefaultJvmArgs = ["--add-modules", "jdk.attach"]
+}
+
+dependencies {
+    implementation "net.bytebuddy:byte-buddy:1.18.10"
+    implementation "org.slf4j:slf4j-api:2.0.18"
+    implementation "ch.qos.logback:logback-classic:1.5.34"
+
+    testImplementation platform("org.junit:junit-bom:5.13.4")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 21
+    options.compilerArgs.addAll(["--add-modules", "jdk.attach"])
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs "--add-modules", "jdk.attach"
+}
+
+jar {
+    archiveClassifier = "plain"
+    manifest {
+        attributes(
+                "Main-Class": application.mainClass.get(),
+                "Agent-Class": "dev.aurora.agent.AuroraAgent",
+                "Premain-Class": "dev.aurora.agent.AuroraAgent",
+                "Can-Redefine-Classes": "true",
+                "Can-Retransform-Classes": "true"
+        )
+    }
+}
+
+shadowJar {
+    archiveClassifier = ""
+    mergeServiceFiles()
+    manifest {
+        attributes(
+                "Main-Class": application.mainClass.get(),
+                "Agent-Class": "dev.aurora.agent.AuroraAgent",
+                "Premain-Class": "dev.aurora.agent.AuroraAgent",
+                "Can-Redefine-Classes": "true",
+                "Can-Retransform-Classes": "true"
+        )
+    }
+}
+
+// Native packaging via the JDK's bundled jpackage tool: an AppImage on Linux, an EXE installer
+// on Windows. Each task must be run on its target OS (jpackage does not cross-package), and the
+// EXE task additionally requires the WiX Toolset to be installed and on PATH.
+def jpackageOutputDir = layout.buildDirectory.dir("jpackage")
+def windowsPortableOutputDir = layout.buildDirectory.dir("windows-portable")
+def jpackageExecutable = "${System.getProperty("java.home")}/bin/jpackage"
+
+tasks.register("appImage", Exec) {
+    group = "distribution"
+    description = "Bundles Aurora as a Linux AppImage-style app-image using jpackage."
+    dependsOn tasks.named("shadowJar")
+    onlyIf { org.gradle.internal.os.OperatingSystem.current().isLinux() }
+    doFirst { jpackageOutputDir.get().getAsFile().mkdirs() }
+    commandLine jpackageExecutable,
+            "--type", "app-image",
+            "--input", tasks.named("shadowJar").get().destinationDirectory.get(),
+            "--dest", jpackageOutputDir.get(),
+            "--name", "Aurora",
+            "--main-jar", tasks.named("shadowJar").get().archiveFileName.get(),
+            "--main-class", application.mainClass.get(),
+            "--app-version", project.version.toString(),
+            "--java-options", "--add-modules=jdk.attach"
+}
+
+tasks.register("packageExe", Exec) {
+    group = "distribution"
+    description = "Bundles Aurora as a Windows EXE installer using jpackage (requires WiX Toolset)."
+    dependsOn tasks.named("shadowJar")
+    onlyIf { org.gradle.internal.os.OperatingSystem.current().isWindows() }
+    doFirst { jpackageOutputDir.get().getAsFile().mkdirs() }
+    commandLine jpackageExecutable,
+            "--type", "exe",
+            "--input", tasks.named("shadowJar").get().destinationDirectory.get(),
+            "--dest", jpackageOutputDir.get(),
+            "--name", "Aurora",
+            "--main-jar", tasks.named("shadowJar").get().archiveFileName.get(),
+            "--main-class", application.mainClass.get(),
+            "--app-version", project.version.toString(),
+            "--java-options", "--add-modules=jdk.attach"
+}
+
+tasks.register("windowsPortable", Exec) {
+    group = "distribution"
+    description = "Bundles Aurora as a portable Windows app directory with Aurora.exe (no installer)."
+    dependsOn tasks.named("shadowJar")
+    onlyIf { org.gradle.internal.os.OperatingSystem.current().isWindows() }
+    doFirst { windowsPortableOutputDir.get().getAsFile().mkdirs() }
+    commandLine jpackageExecutable,
+            "--type", "app-image",
+            "--input", tasks.named("shadowJar").get().destinationDirectory.get(),
+            "--dest", windowsPortableOutputDir.get(),
+            "--name", "Aurora",
+            "--main-jar", tasks.named("shadowJar").get().archiveFileName.get(),
+            "--main-class", application.mainClass.get(),
+            "--app-version", project.version.toString(),
+            "--java-options", "--add-modules=jdk.attach"
+}
