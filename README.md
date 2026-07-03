@@ -1,6 +1,8 @@
 # Aurora
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/Mathelord/Aurora/total?style=for-the-badge&label=Downloads)](https://github.com/Mathelord/Aurora/releases)
+> [!WARNING]
+> Silentaura is getting detected on matrix anticheat i dont know how to fix it yet
 
 > [!WARNING]
 > This project is still in progress.
