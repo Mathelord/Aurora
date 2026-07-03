@@ -11,6 +11,8 @@
 
 Aurora is a Minecraft 1.21.4 fabric injection client with a external gui.
 
+Make sure to check out [Mathelord/Eclipse](https://github.com/Mathelord/Eclipse).
+
 ## Modules
 
 - Reach
