@@ -2,7 +2,7 @@
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/Mathelord/Aurora/total?style=for-the-badge&label=Downloads)](https://github.com/Mathelord/Aurora/releases)
 > [!WARNING]
-> Silentaura and Aim assist is getting detected on matrix anticheat i dont know how to fix it yet
+> Silentaura and Aim assist are getting detected on matrix anticheat i dont know how to fix it yet
 
 > [!WARNING]
 > This project is still in progress.
