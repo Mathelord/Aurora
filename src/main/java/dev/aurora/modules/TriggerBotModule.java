@@ -6,6 +6,7 @@ import dev.aurora.api.events.TickEvent;
 import dev.aurora.combat.CriticalHitDetector;
 import dev.aurora.input.RealClickSimulator;
 import dev.aurora.input.CritSprintReset;
+import dev.aurora.minecraft.AimContext;
 import dev.aurora.minecraft.CombatState;
 import dev.aurora.minecraft.AimTarget;
 import dev.aurora.minecraft.MinecraftBridge;
@@ -20,6 +21,7 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 public final class TriggerBotModule extends AbstractModule {
     private static final double MISS_SWING_COOLDOWN_THRESHOLD = 0.92D;
+    private static final double MISS_SWING_REACH = 6.0D;
     private static final double PERFECT_COOLDOWN_THRESHOLD = 0.99D;
     private static final double PERFECT_EARLY_COOLDOWN_THRESHOLD = 0.848D;
 
@@ -27,8 +29,7 @@ public final class TriggerBotModule extends AbstractModule {
     private final ModuleSetting critMode;
     private final ModuleSetting perfectEarlyChance;
     private final ModuleSetting perfectLateChance;
-    private final ModuleSetting missChanceMin;
-    private final ModuleSetting missChanceMax;
+    private final ModuleSetting missChance;
     private final ModuleSetting pauseOnConsume;
     private final ModuleSetting holdMouse;
     private final CritSprintReset critSprintReset;
@@ -49,10 +50,8 @@ public final class TriggerBotModule extends AbstractModule {
                 .description("Chance that a swing attacks at Eclipse's early 84.8% cooldown threshold.");
         perfectLateChance = setting("perfect-late", "Perfect Late %", 0.0D, 0.0D, 100.0D, 1.0D)
                 .description("Chance that a swing waits an additional 80-180 ms after full cooldown.");
-        missChanceMin = setting("miss-chance-min", "Miss Chance Min %", 0.0D, 0.0D, 100.0D, 1.0D)
-                .description("Minimum randomized chance to perform an intentional miss swing when no target is under the crosshair.");
-        missChanceMax = setting("miss-chance-max", "Miss Chance Max %", 0.0D, 0.0D, 100.0D, 1.0D)
-                .description("Maximum randomized chance to perform an intentional miss swing when no target is under the crosshair.");
+        missChance = setting("miss-chance", "Miss Chance %", 0.0D, 0.0D, 100.0D, 1.0D)
+                .description("Chance to swing and miss once per cooldown when a player is nearby but not under the crosshair.");
         pauseOnConsume = booleanSetting("pause-on-consume", "Pause While Using", true)
                 .description("Pauses attacks while eating, drinking, blocking, or using another item.");
         holdMouse = booleanSetting("hold-mouse", "Hold Left Mouse", false)
@@ -127,7 +126,10 @@ public final class TriggerBotModule extends AbstractModule {
     }
 
     private void maybeMissSwing() {
-        if (missChanceMax.value() <= 0.0D || minecraft.attackCooldown() < MISS_SWING_COOLDOWN_THRESHOLD) {
+        if (missChance.value() <= 0.0D) {
+            return;
+        }
+        if (minecraft.attackCooldown() < MISS_SWING_COOLDOWN_THRESHOLD) {
             missRolled = false;
             return;
         }
@@ -135,15 +137,11 @@ public final class TriggerBotModule extends AbstractModule {
             return;
         }
         missRolled = true;
-        if (ThreadLocalRandom.current().nextDouble(100.0D) < rollMissChance()) {
+        AimContext nearby = minecraft.aimContext(MISS_SWING_REACH, true);
+        if (nearby.available() && !nearby.targets().isEmpty()
+                && ThreadLocalRandom.current().nextInt(100) < (int) Math.round(missChance.value())) {
             minecraft.swingMainHand();
         }
-    }
-
-    private double rollMissChance() {
-        double min = Math.min(missChanceMin.value(), missChanceMax.value());
-        double max = Math.max(missChanceMin.value(), missChanceMax.value());
-        return max <= min ? min : ThreadLocalRandom.current().nextDouble(min, max);
     }
 
     private boolean canAttackWithCritTiming(CriticalHitDetector.Detection critical) {

@@ -14,38 +14,38 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
- * Shared "hold packets back, replay them later" engine that powers BackTrack, KnockbackDelay and
- * Blink. Mirrors the Eclipse addon's {@code ConnectionLag}/{@code BlinkPlus}, adapted to Aurora's
- * reflection-only bridge: instead of cancelling a Meteor event and later calling
- * {@code packet.apply(listener)} or {@code connection.send(packet)} directly, both replay paths are
- * done through small reflective lookups here.
+ * Shared "hold packets back, replay them later" engine for modules that need a controlled view of
+ * network state. Aurora has no compile-time Minecraft dependency, so packet replay is resolved from
+ * the active runtime namespace rather than through mapped packet classes.
  *
- * <p>Inbound holding ({@link #request}) is time-based and shared by every caller — the effective
- * delay is the largest latency any active request asks for, so BackTrack and KnockbackDelay can both
- * be active without fighting each other. Outbound holding ({@link #holdOutbound}/{@link
- * #releaseOutbound}) is a simple on/off flag for Blink, flushed manually rather than by a timer.
+ * <p>Inbound holding ({@link #request}) is time-based and shared by every caller. The effective
+ * delay is the largest active request, allowing independent modules to coexist. Outbound holding
+ * ({@link #holdOutbound}/{@link #releaseOutbound}) is flushed explicitly rather than by a timer.
  */
 public final class PacketRelay {
     private static final PacketRelay INSTANCE = new PacketRelay();
-    private static final List<String> OUTBOUND_SEND_METHOD_NAMES = List.of("send", "method_10743");
-    private static final List<String> PACKET_LISTENER_ACCESSOR_NAMES = List.of(
-            "getPacketListener", "getPacketListener", "method_10744"
-    );
-    private static final List<String> PACKET_LISTENER_FIELD_NAMES = List.of(
-            "packetListener", "listener", "handler", "field_11652"
-    );
-    private static final List<String> PACKET_APPLY_METHOD_NAMES = List.of("apply", "method_65081");
+    // Yarn, intermediary and official-obfuscated names for the supported Minecraft versions.
+    private static final List<String> OUTBOUND_SEND_METHOD_NAMES = List.of("send", "method_10743", "a");
+    private static final List<String> PACKET_APPLY_METHOD_NAMES = List.of("apply", "method_65081", "a");
     private static final Set<String> ENTITY_MOVE_PACKET_CLASSES = Set.of(
             "net.minecraft.network.packet.s2c.play.EntityS2CPacket",
             "net.minecraft.class_2684"
+    );
+    private static final Set<String> PROTOCOL_CRITICAL_INBOUND_CLASSES = Set.of(
+            // KeepAliveS2CPacket: named, intermediary, official 1.21.4, official 1.21.11.
+            "net.minecraft.network.packet.s2c.common.KeepAliveS2CPacket",
+            "net.minecraft.class_2670", "zg", "abl",
+            // CommonPingS2CPacket drives the transaction-style CommonPongC2SPacket response.
+            "net.minecraft.network.packet.s2c.common.CommonPingS2CPacket",
+            "net.minecraft.class_6373", "zh", "abm"
     );
     private static final double DELTA_PER_BLOCK = 4096.0D;
     private static final int MAX_HELD_INBOUND = 8192;
     private static final int MAX_HELD_OUTBOUND = 512;
 
     private final Map<Object, Request> inboundRequests = new ConcurrentHashMap<>();
-    private final ConcurrentLinkedDeque<Held> heldInbound = new ConcurrentLinkedDeque<>();
-    private final ConcurrentLinkedDeque<Held> heldOutbound = new ConcurrentLinkedDeque<>();
+    private final ConcurrentLinkedDeque<InboundPacket> heldInbound = new ConcurrentLinkedDeque<>();
+    private final ConcurrentLinkedDeque<OutboundPacket> heldOutbound = new ConcurrentLinkedDeque<>();
     private final AtomicBoolean replayFailureLogged = new AtomicBoolean();
     private final AtomicLong heldInboundTotal = new AtomicLong();
     private final AtomicLong replayedInboundTotal = new AtomicLong();
@@ -57,7 +57,7 @@ public final class PacketRelay {
     private volatile int effectiveInboundLatencyMs;
     private volatile boolean forceFlushInbound;
     private volatile boolean outboundHeld;
-    private volatile boolean releasing;
+    private final ThreadLocal<Boolean> replayingOutbound = ThreadLocal.withInitial(() -> false);
 
     private PacketRelay() {
     }
@@ -128,7 +128,7 @@ public final class PacketRelay {
         double x = 0.0D;
         double y = 0.0D;
         double z = 0.0D;
-        for (Held held : heldInbound) {
+        for (InboundPacket held : heldInbound) {
             if (held.entityId == entityId) {
                 x += held.deltaX;
                 y += held.deltaY;
@@ -147,37 +147,57 @@ public final class PacketRelay {
     /** Sends every held outbound packet immediately, in order, then turns outbound holding off. */
     public void flushOutbound() {
         outboundHeld = false;
-        Held held;
+        OutboundPacket held;
         while ((held = heldOutbound.pollFirst()) != null) {
             resend(held.connection, held.packet);
         }
     }
 
-    /** Called from the packet dispatch hook. Returns whether {@code packet} should be held back
-     * instead of actually being sent/received. */
-    public boolean shouldSuppress(boolean inbound, Object connection, Object packet) {
-        if (releasing || connection == null || packet == null) {
+    /** Called at Minecraft's static packet-dispatch boundary. The listener is supplied directly by
+     * Minecraft, avoiding a reflective lookup through {@code ClientConnection} during replay. */
+    public boolean captureInbound(Object listener, Object packet) {
+        if (listener == null || packet == null) {
             return false;
         }
-        if (inbound) {
-            pruneExpiredInboundRequests();
-            int delay = effectiveInboundLatencyMs;
-            if (delay <= 0) {
-                return false;
-            }
-            heldInbound.addLast(new Held(connection, packet, System.currentTimeMillis() + delay));
-            heldInboundTotal.incrementAndGet();
-            if (heldInbound.size() > MAX_HELD_INBOUND) {
-                forceFlushInbound = true;
-            }
-            return true;
-        }
-        if (!outboundHeld) {
+        // These packets exist solely to solicit a time-sensitive client response. Holding them
+        // causes anti-cheats and vanilla timeout handling to treat the connection as unresponsive.
+        if (hasTypeName(packet, PROTOCOL_CRITICAL_INBOUND_CLASSES)) {
             return false;
         }
-        heldOutbound.addLast(new Held(connection, packet, 0L));
+        pruneExpiredInboundRequests();
+        int delay = effectiveInboundLatencyMs;
+        if (delay <= 0) {
+            return false;
+        }
+        MoveDelta move = moveDelta(packet);
+        heldInbound.addLast(new InboundPacket(listener, packet, System.currentTimeMillis() + delay,
+                move.entityId, move.x, move.y, move.z));
+        heldInboundTotal.incrementAndGet();
+        if (heldInbound.size() > MAX_HELD_INBOUND) {
+            forceFlushInbound = true;
+        }
+        return true;
+    }
+
+    /** Called from the connection's one-argument send hook. */
+    public boolean captureOutbound(Object connection, Object packet) {
+        if (replayingOutbound.get() || connection == null || packet == null || !outboundHeld) {
+            return false;
+        }
+        if (isProtocolTransition(packet)) {
+            // A terminal packet changes the channel codec/state. Everything encoded under the old
+            // state must leave first, and the transition itself must execute through vanilla.
+            flushOutbound();
+            return false;
+        }
+        heldOutbound.addLast(new OutboundPacket(connection, packet));
         heldOutboundTotal.incrementAndGet();
         return true;
+    }
+
+    public static boolean isProtocolTransition(Object packet) {
+        return packet != null && readBoolean(packet,
+                List.of("transitionsNetworkState", "method_55943", "d"));
     }
 
     /** Drains everything due for release. Call once per client tick. */
@@ -186,10 +206,10 @@ public final class PacketRelay {
         boolean releaseEverything = effectiveInboundLatencyMs <= 0 || forceFlushInbound;
         forceFlushInbound = false;
         long now = System.currentTimeMillis();
-        Held held;
+        InboundPacket held;
         while ((held = heldInbound.peekFirst()) != null && (releaseEverything || held.releaseAtMs <= now)) {
             heldInbound.pollFirst();
-            replayInbound(held.connection, held.packet);
+            replayInbound(held.listener, held.packet);
         }
         if (heldOutbound.size() > MAX_HELD_OUTBOUND) {
             flushOutbound();
@@ -214,17 +234,9 @@ public final class PacketRelay {
         effectiveInboundLatencyMs = max;
     }
 
-    private void replayInbound(Object connection, Object packet) {
+    private void replayInbound(Object listener, Object packet) {
         try {
-            Object listener = invokeNoArgs(connection, PACKET_LISTENER_ACCESSOR_NAMES);
-            if (listener == null) {
-                listener = findField(connection, PACKET_LISTENER_FIELD_NAMES);
-            }
-            // Try the known apply(...) names first, then fall back to matching by shape so replay
-            // survives mapping changes: a Packet's only single-argument method that accepts a
-            // PacketListener is apply(listener).
-            if (listener == null
-                    || !(invokeCompatible(packet, PACKET_APPLY_METHOD_NAMES, listener)
+            if (!(invokeCompatible(packet, PACKET_APPLY_METHOD_NAMES, listener)
                     || invokeSingleArgAccepting(packet, listener))) {
                 logReplayFailureOnce("Could not replay a held inbound packet (" + packet.getClass().getName() + ")");
                 return;
@@ -236,7 +248,7 @@ public final class PacketRelay {
     }
 
     private void resend(Object connection, Object packet) {
-        releasing = true;
+        replayingOutbound.set(true);
         try {
             // Known send(...) names first, then match by shape (the single-argument method that
             // accepts this packet) so a renamed send survives across mappings.
@@ -249,7 +261,7 @@ public final class PacketRelay {
         } catch (RuntimeException exception) {
             logReplayFailureOnce("Outbound packet resend failed: " + exception.getMessage());
         } finally {
-            releasing = false;
+            replayingOutbound.remove();
         }
     }
 
@@ -268,7 +280,7 @@ public final class PacketRelay {
         effectiveInboundLatencyMs = 0;
         forceFlushInbound = false;
         outboundHeld = false;
-        releasing = false;
+        replayingOutbound.remove();
         replayFailureLogged.set(false);
         lastError = "";
     }
@@ -404,15 +416,11 @@ public final class PacketRelay {
     private record Request(int latencyMs, long expiresAtMs) {
     }
 
-    private record Held(Object connection, Object packet, long releaseAtMs,
-                        int entityId, double deltaX, double deltaY, double deltaZ) {
-        private Held(Object connection, Object packet, long releaseAtMs) {
-            this(connection, packet, releaseAtMs, moveDelta(packet));
-        }
+    private record InboundPacket(Object listener, Object packet, long releaseAtMs,
+                                 int entityId, double deltaX, double deltaY, double deltaZ) {
+    }
 
-        private Held(Object connection, Object packet, long releaseAtMs, MoveDelta move) {
-            this(connection, packet, releaseAtMs, move.entityId, move.x, move.y, move.z);
-        }
+    private record OutboundPacket(Object connection, Object packet) {
     }
 
     private record MoveDelta(int entityId, double x, double y, double z) {

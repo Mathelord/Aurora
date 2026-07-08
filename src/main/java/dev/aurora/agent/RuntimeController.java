@@ -3,6 +3,8 @@ package dev.aurora.agent;
 import dev.aurora.api.ClientModule;
 import dev.aurora.aim.AimAngles;
 import dev.aurora.aim.DecoupledAimState;
+import dev.aurora.aim.FreeCameraState;
+import dev.aurora.aim.SilentAimSystem;
 import dev.aurora.api.ModuleManager;
 import dev.aurora.api.ModuleSetting;
 import dev.aurora.api.events.PacketEvent;
@@ -17,12 +19,19 @@ import dev.aurora.minecraft.MinecraftBridge;
 import dev.aurora.minecraft.ReflectionMinecraftBridge;
 import dev.aurora.modules.AimAssistModule;
 import dev.aurora.modules.AutoToolModule;
+import dev.aurora.modules.AutoAnchorModule;
+import dev.aurora.modules.BackTrackModule;
+import dev.aurora.modules.BlinkModule;
 import dev.aurora.modules.EspModule;
 import dev.aurora.modules.FastPlaceModule;
+import dev.aurora.modules.FreeLookModule;
+import dev.aurora.modules.FreecamModule;
 import dev.aurora.modules.FullbrightModule;
 import dev.aurora.modules.HitSwapModule;
 import dev.aurora.modules.JumpResetModule;
+import dev.aurora.modules.KnockbackDelayModule;
 import dev.aurora.modules.NoJumpDelayModule;
+import dev.aurora.modules.NetworkDelayModule;
 import dev.aurora.modules.ReachModule;
 import dev.aurora.modules.TrajectoriesModule;
 import dev.aurora.modules.SilentAuraModule;
@@ -33,13 +42,16 @@ import dev.aurora.modules.TrailModule;
 import dev.aurora.modules.TriggerBotModule;
 import dev.aurora.network.KnockbackPackets;
 import dev.aurora.network.PacketRelay;
-import dev.aurora.network.RotationPacketCorrector;
+import dev.aurora.social.FriendManager;
 import dev.aurora.render.WorldGeometryBatch;
+import dev.aurora.render.SilentAimCrosshairIndicator;
 import dev.aurora.util.Json;
 
 import java.lang.instrument.Instrumentation;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.concurrent.Executors;
@@ -57,11 +69,13 @@ public final class RuntimeController {
     private final MinecraftBridge minecraft;
     private final SilentAuraModule silentAura;
     private final TriggerBotModule triggerBot;
+    private final FreeLookModule freeLook;
+    private final FreecamModule freecam;
     private final IpcAgentClient ipc;
     private final HookInstaller hooks;
-    private final RotationPacketCorrector rotationCorrector = RotationPacketCorrector.minecraft1214();
     private final PacketRelay packetRelay = PacketRelay.get();
     private final AtomicBoolean uninstalled = new AtomicBoolean();
+    private final AtomicBoolean moduleStateChangedOffTick = new AtomicBoolean();
     private final Map<String, Boolean> moduleKeyStates = new HashMap<>();
     private final ScheduledExecutorService hookWatchdog = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "aurora-hook-watchdog");
@@ -82,11 +96,13 @@ public final class RuntimeController {
     private final ClientConfig config = ClientConfig.standard();
     private final HitSwapModule hitSwap;
     private volatile String lastSavedFingerprint = "";
+    private volatile boolean silentAimCrosshairIndicator = true;
 
-    private RuntimeController(IpcAgentClient ipc) {
+    private RuntimeController(IpcAgentClient ipc, String minecraftVersion) {
         this.ipc = ipc;
         this.minecraft = new ReflectionMinecraftBridge(message -> ipc.log("ERROR", message));
-        this.hooks = new HookInstaller(message -> ipc.log("ERROR", message));
+        this.hooks = new HookInstaller(HookProfile.forVersion(minecraftVersion),
+                message -> ipc.log("ERROR", message));
         this.modules = new ModuleManager(message -> ipc.log("ERROR", message));
         this.packetRelay.setDiagnosticSink(message -> ipc.log("ERROR", "Packet relay: " + message));
         WorldGeometryBatch.setDiagnosticSink(message -> ipc.log("ERROR", message));
@@ -94,12 +110,15 @@ public final class RuntimeController {
         ActivationClickSuppressor.init(minecraft);
         KnockbackPackets knockbackPackets = KnockbackPackets.minecraft1214();
         modules.register(new ReachModule(minecraft));
+        modules.register(new BackTrackModule(minecraft, packetRelay));
+        modules.register(new AutoAnchorModule(minecraft));
         modules.register(new AimAssistModule(minecraft, message -> ipc.log("INFO", message)));
         silentAura = new SilentAuraModule(minecraft);
         modules.register(silentAura);
         modules.register(new TargetRingModule(minecraft, silentAura::currentAimTargetId));
         triggerBot = new TriggerBotModule(minecraft);
         modules.register(triggerBot);
+        modules.register(new KnockbackDelayModule(minecraft, knockbackPackets, packetRelay));
         modules.register(new JumpResetModule(minecraft, knockbackPackets));
         modules.register(new NoJumpDelayModule(minecraft));
         hitSwap = new HitSwapModule(minecraft);
@@ -112,15 +131,26 @@ public final class RuntimeController {
         modules.register(new EspModule(minecraft, trajectories::currentHitEntityId));
         modules.register(new TracersModule(minecraft));
         modules.register(new FullbrightModule(minecraft));
+        freeLook = new FreeLookModule(minecraft);
+        modules.register(freeLook);
+        freecam = new FreecamModule(minecraft);
+        modules.register(freecam);
         modules.register(new AutoToolModule(minecraft));
         modules.register(new FastPlaceModule(minecraft));
+        modules.register(new NetworkDelayModule(packetRelay));
+        modules.register(new BlinkModule(minecraft, packetRelay, () -> moduleStateChangedOffTick.set(true)));
         modules.register(new TextGuiModule(minecraft, modules::modules));
         config.applyTo(modules, message -> ipc.log("WARN", message));
         lastSavedFingerprint = moduleStateFingerprint();
     }
 
     public static RuntimeController install(Instrumentation instrumentation, IpcAgentClient ipc) {
-        RuntimeController controller = new RuntimeController(ipc);
+        return install(instrumentation, ipc, "");
+    }
+
+    public static RuntimeController install(Instrumentation instrumentation, IpcAgentClient ipc,
+                                            String minecraftVersion) {
+        RuntimeController controller = new RuntimeController(ipc, minecraftVersion);
         instance = controller;
         HookDispatch.bind(controller);
         controller.publishStatus("Installing hooks");
@@ -148,6 +178,25 @@ public final class RuntimeController {
                 saveConfigIfChanged();
             }
         }
+        if (message.type() == IpcMessage.Type.GLOBAL_SETTINGS) {
+            silentAimCrosshairIndicator = Json.booleanField(
+                    message.payload(), "silentAimCrosshairIndicator", silentAimCrosshairIndicator);
+        }
+        if (message.type() == IpcMessage.Type.FRIENDS) {
+            applyFriends(message.payload());
+        }
+    }
+
+    private void applyFriends(String payload) {
+        List<String> names = new ArrayList<>();
+        if (Json.parse(payload) instanceof List<?> entries) {
+            for (Object entry : entries) {
+                if (entry instanceof String name) {
+                    names.add(name);
+                }
+            }
+        }
+        FriendManager.get().setAll(names);
     }
 
     private void uninstall() {
@@ -179,6 +228,7 @@ public final class RuntimeController {
 
     public void onTick() {
         long count = ticks.incrementAndGet();
+        boolean stateChangedOffTick = moduleStateChangedOffTick.getAndSet(false);
         packetRelay.onTick();
         ActivationClickSuppressor.armIfAttackKeyHeld(
                 silentAura.suppressPhysicalHeldAttack()
@@ -186,7 +236,7 @@ public final class RuntimeController {
         String before = moduleStateFingerprint();
         processModuleKeybinds();
         modules.onTick(TickEvent.now());
-        if (!before.equals(moduleStateFingerprint())) {
+        if (stateChangedOffTick || !before.equals(moduleStateFingerprint())) {
             publishModules();
             saveConfigIfChanged();
         }
@@ -219,7 +269,15 @@ public final class RuntimeController {
             boolean down = keybind >= 0 && minecraft.isKeyDown(keybind);
             boolean wasDown = moduleKeyStates.getOrDefault(module.id(), false);
             moduleKeyStates.put(module.id(), down);
-            if (!inputBlocked && down && !wasDown) {
+            if (inputBlocked || keybind < 0) {
+                continue;
+            }
+            if (module.holdToActivate()) {
+                // Momentary: track the key state exactly so the module is on only while held.
+                if (down != module.enabled()) {
+                    module.setEnabled(down);
+                }
+            } else if (down && !wasDown) {
                 module.setEnabled(!module.enabled());
             }
         }
@@ -228,6 +286,12 @@ public final class RuntimeController {
     public void onRender(Object context) {
         renders.incrementAndGet();
         modules.onRender(RenderEvent.now(context));
+        SilentAimSystem silentAim = SilentAimSystem.get();
+        DecoupledAimState decoupled = DecoupledAimState.get();
+        if (silentAimCrosshairIndicator && silentAim.hasActiveSilentAim() && decoupled.isActive()) {
+            SilentAimCrosshairIndicator.render(minecraft, context, decoupled.visualAngles(),
+                    new AimAngles(silentAim.lastSilentYaw(), silentAim.lastSilentPitch()));
+        }
     }
 
     public void onWorldRender(Object matrixStack, Object vertexConsumers) {
@@ -241,23 +305,42 @@ public final class RuntimeController {
 
     /** Returns whether {@code packet} should be suppressed (held back by {@link PacketRelay} for
      * later replay) instead of actually being sent/received this call. */
-    public boolean onPacket(PacketEvent.Direction direction, Object connection, Object packet) {
+    public boolean onPacket(PacketEvent.Direction direction, Object endpoint, Object packet) {
         packets.incrementAndGet();
         if (direction == PacketEvent.Direction.INBOUND) {
             inboundPackets.incrementAndGet();
         } else {
             outboundPackets.incrementAndGet();
         }
-        if (direction == PacketEvent.Direction.OUTBOUND) {
-            rotationCorrector.correct(packet);
-        }
         modules.onPacket(PacketEvent.now(direction, packet));
-        return packetRelay.shouldSuppress(direction == PacketEvent.Direction.INBOUND, connection, packet);
+        return direction == PacketEvent.Direction.INBOUND
+                ? packetRelay.captureInbound(endpoint, packet)
+                : packetRelay.captureOutbound(endpoint, packet);
+    }
+
+    /** The Free Look / Freecam view state currently in control of the camera, or {@code null} when
+     * neither is active. Freecam wins if both are somehow on. */
+    private FreeCameraState activeDetachedCamera() {
+        if (freecam.enabled() && freecam.state().isActive()) {
+            return freecam.state();
+        }
+        if (freeLook.enabled() && freeLook.state().isActive()) {
+            return freeLook.state();
+        }
+        return null;
     }
 
     public boolean onLook(Object entity, double cursorDeltaX, double cursorDeltaY) {
+        if (!minecraft.isLocalPlayer(entity)) {
+            return false;
+        }
+        FreeCameraState detached = activeDetachedCamera();
+        if (detached != null) {
+            detached.applyMouseDelta(cursorDeltaX, cursorDeltaY);
+            return true;
+        }
         DecoupledAimState state = DecoupledAimState.get();
-        if (!state.isActive() || !minecraft.isLocalPlayer(entity)) {
+        if (!state.isActive()) {
             return false;
         }
         state.applyMouseDelta(cursorDeltaX, cursorDeltaY);
@@ -265,17 +348,47 @@ public final class RuntimeController {
     }
 
     public boolean onCameraBegin(Object focusedEntity) {
+        if (!minecraft.isLocalPlayer(focusedEntity)) {
+            return false;
+        }
+        FreeCameraState detached = activeDetachedCamera();
+        if (detached != null) {
+            // Point the entity at the free view (with previous-tick rotation) so the game builds the
+            // camera — including any third-person orbit offset — around the free look direction.
+            AimAngles view = detached.viewAngles();
+            return minecraft.applyCameraEntityRotation(focusedEntity, view.yaw(), view.pitch());
+        }
         DecoupledAimState state = DecoupledAimState.get();
-        if (!state.isActive() || !minecraft.isLocalPlayer(focusedEntity)) {
+        if (!state.isActive()) {
             return false;
         }
         AimAngles visual = state.visualAngles();
         return minecraft.applyEntityRotation(focusedEntity, visual.yaw(), visual.pitch());
     }
 
-    public void onCameraEnd(Object camera, Object focusedEntity) {
+    public void onCameraEnd(Object camera, Object focusedEntity, double tickDelta) {
+        if (!minecraft.isLocalPlayer(focusedEntity)) {
+            return;
+        }
+        FreeCameraState detached = activeDetachedCamera();
+        if (detached != null) {
+            // Restore the body to its frozen angle (current and previous tick) so movement, hitboxes
+            // and the rendered model stay put, then point the render camera at the free view and (for
+            // Freecam) relocate it to the interpolated free-flying position.
+            AimAngles body = detached.bodyAngles();
+            minecraft.applyCameraEntityRotation(focusedEntity, body.yaw(), body.pitch());
+            AimAngles view = detached.viewAngles();
+            minecraft.applyCameraRotation(camera, view.yaw(), view.pitch());
+            detached.interpolatedPosition(tickDelta).ifPresent(pos -> {
+                // Force the "third person" flag so the player model renders and the hand is hidden
+                // even though Freecam runs in first-person perspective.
+                minecraft.setCameraDetached(camera, true);
+                minecraft.applyCameraPosition(camera, pos[0], pos[1], pos[2]);
+            });
+            return;
+        }
         DecoupledAimState state = DecoupledAimState.get();
-        if (!state.isActive() || !minecraft.isLocalPlayer(focusedEntity)) {
+        if (!state.isActive()) {
             return;
         }
         AimAngles silent = state.silentAngles();
@@ -289,6 +402,12 @@ public final class RuntimeController {
     }
 
     public void onMovementInput(Object input) {
+        FreeCameraState detached = activeDetachedCamera();
+        if (detached != null && detached.freezeMovement()) {
+            // Freecam: keep the body stationary while the detached camera flies.
+            minecraft.freezeMovementInput(input);
+            return;
+        }
         DecoupledAimState state = DecoupledAimState.get();
         if (!state.isActive()) {
             return;
@@ -362,6 +481,7 @@ public final class RuntimeController {
         sample.put("relayFailures", relay.replayFailures());
         String lastError = !relay.lastError().isBlank() ? relay.lastError() : WorldGeometryBatch.lastError();
         sample.put("lastError", lastError);
+        sample.put("onlinePlayers", minecraft.onlinePlayerNames());
         ipc.send(IpcMessage.Type.EVENT_SAMPLE, Json.object(sample));
     }
 
@@ -378,11 +498,13 @@ public final class RuntimeController {
         long tickCount = ticks.get();
         long renderCount = renders.get();
         long worldRenderCount = worldRenders.get();
-        if (tickCount > 0 && renderCount > 0 && worldRenderCount > 0) {
+        boolean worldRenderingExpected = hooks.supportsWorldRendering();
+        if (tickCount > 0 && renderCount > 0 && (!worldRenderingExpected || worldRenderCount > 0)) {
             if (!hookHealthyLogged) {
                 hookHealthyLogged = true;
                 ipc.log("INFO", "Aurora hooks active. ticks=" + tickCount + ", HUD renders="
-                        + renderCount + ", world renders=" + worldRenderCount + ".");
+                        + renderCount + ", world renders=" + worldRenderCount
+                        + (worldRenderingExpected ? "." : " (unsupported for this render pipeline)."));
             }
             return;
         }
@@ -394,7 +516,7 @@ public final class RuntimeController {
             deadRenderHookLogged = true;
             ipc.log("WARN", "Aurora render hook has not fired. In-game overlay text may not render; module logic can still run if ticks are active.");
         }
-        if (worldRenderCount == 0 && !deadWorldRenderHookLogged) {
+        if (worldRenderingExpected && worldRenderCount == 0 && !deadWorldRenderHookLogged) {
             deadWorldRenderHookLogged = true;
             ipc.log("WARN", "Aurora 3D world-render hook has not fired. Target Ring, Trail and ghost boxes cannot render.");
         }

@@ -4,6 +4,7 @@ import dev.aurora.aim.AimAngles;
 import dev.aurora.aim.Vec3;
 import dev.aurora.api.ModuleSetting;
 import dev.aurora.api.events.TickEvent;
+import dev.aurora.api.events.RenderEvent;
 import dev.aurora.input.RealClickSimulator;
 import dev.aurora.minecraft.AimContext;
 import dev.aurora.minecraft.AimTarget;
@@ -45,10 +46,22 @@ class SilentAuraModuleTest {
         set("perfect-late", 0.0D);
         module.setEnabled(true);
 
+        module.onRender(RenderEvent.now(null));
         module.onTick(TickEvent.now());
 
         assertTrue(bridge.rotationApplied);
         assertEquals("target", bridge.attackedTarget);
+    }
+
+    @Test
+    void advancesAimOnRenderOnly() {
+        module.setEnabled(true);
+
+        module.onTick(TickEvent.now());
+        assertFalse(bridge.rotationApplied);
+
+        module.onRender(RenderEvent.now(null));
+        assertTrue(bridge.rotationApplied);
     }
 
     @Test
@@ -59,9 +72,22 @@ class SilentAuraModuleTest {
         bridge.crosshairEntityId = null;
         module.setEnabled(true);
 
+        module.onRender(RenderEvent.now(null));
         module.onTick(TickEvent.now());
 
         assertTrue(bridge.rotationApplied);
+        assertNull(bridge.attackedTarget);
+    }
+
+    @Test
+    void missUsesRealClickWhenNearbyTargetIsOutsideCrosshair() {
+        set("miss-chance", 100.0D);
+        bridge.crosshairEntityId = null;
+        module.setEnabled(true);
+
+        module.onTick(TickEvent.now());
+
+        assertEquals(1, bridge.clicks);
         assertNull(bridge.attackedTarget);
     }
 
@@ -127,6 +153,7 @@ class SilentAuraModuleTest {
         // The entity the reach-limited vanilla crosshair currently rests on (null = nothing in reach).
         private String crosshairEntityId = "target";
         private String attackedTarget;
+        private int clicks;
         private CombatState combatState = CombatState.unavailable();
 
         @Override
@@ -158,6 +185,7 @@ class SilentAuraModuleTest {
         @Override
         public boolean doAttack() {
             // A real left click attacks whatever the vanilla (reach-limited) crosshair is on.
+            clicks++;
             attackedTarget = crosshairEntityId;
             return true;
         }

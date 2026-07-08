@@ -4,6 +4,9 @@ import java.util.List;
 
 public enum ItemType {
     END_CRYSTAL("END_CRYSTAL", "field_8301", "wf"),
+    TOTEM_OF_UNDYING("TOTEM_OF_UNDYING", "field_8288"),
+    RESPAWN_ANCHOR("RESPAWN_ANCHOR", "field_23141", "xT"),
+    GLOWSTONE("GLOWSTONE", "field_8801", "fJ"),
     OBSIDIAN("OBSIDIAN", "field_8281", "eR"),
     WOODEN_AXE("WOODEN_AXE", "field_8406", "pu"),
     STONE_AXE("STONE_AXE", "field_8062", "pz"),

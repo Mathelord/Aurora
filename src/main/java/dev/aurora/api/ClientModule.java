@@ -24,6 +24,15 @@ public interface ClientModule {
 
     void setKeybind(int keyCode);
 
+    /**
+     * Whether this module's keybind should act as a momentary hold (enabled only while the key is
+     * held, disabled on release) instead of the default press-to-toggle behaviour. Modules that
+     * expose a "Hold to activate" option return the current value of that option.
+     */
+    default boolean holdToActivate() {
+        return false;
+    }
+
     List<ModuleSetting> settings();
 
     default void onEnable() {

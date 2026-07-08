@@ -14,9 +14,16 @@ public final class GhostBoxRenderer {
     }
 
     public static void render(WorldGeometryBatch geometry, Vec3 position, int colorRgb) {
+        render(geometry, position, HALF_WIDTH * 2.0D, HEIGHT, colorRgb);
+    }
+
+    public static void render(WorldGeometryBatch geometry, Vec3 position,
+                              double width, double height, int colorRgb) {
         if (geometry == null || position == null) return;
-        Vec3 min = new Vec3(position.x() - HALF_WIDTH, position.y(), position.z() - HALF_WIDTH);
-        Vec3 max = new Vec3(position.x() + HALF_WIDTH, position.y() + HEIGHT, position.z() + HALF_WIDTH);
+        double halfWidth = Math.max(0.0D, width) / 2.0D;
+        Vec3 min = new Vec3(position.x() - halfWidth, position.y(), position.z() - halfWidth);
+        Vec3 max = new Vec3(position.x() + halfWidth, position.y() + Math.max(0.0D, height),
+                position.z() + halfWidth);
         geometry.box(min, max, withAlpha(colorRgb, FILL_ALPHA), withAlpha(colorRgb, BORDER_ALPHA));
     }
 

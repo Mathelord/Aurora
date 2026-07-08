@@ -32,11 +32,12 @@ public final class KnockbackPackets {
                 "net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket",
                 "net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket",
                 "net.minecraft.class_2743",
-                "aex"
+                "aex", "agr"
         ), Set.of(
                 "net.minecraft.network.packet.s2c.play.ExplosionS2CPacket",
                 "net.minecraft.network.protocol.game.ClientboundExplodePacket",
-                "net.minecraft.class_2664"
+                "net.minecraft.class_2664",
+                "acr", "aek"
         ));
     }
 
@@ -53,7 +54,7 @@ public final class KnockbackPackets {
 
     private static boolean hasExplosionKnockback(Object packet) {
         for (Method method : packet.getClass().getMethods()) {
-            if (!List.of("playerKnockback", "comp_2884").contains(method.getName())
+            if (!List.of("playerKnockback", "comp_2884", "c", "e").contains(method.getName())
                     || method.getParameterCount() != 0) {
                 continue;
             }

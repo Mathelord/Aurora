@@ -4,12 +4,17 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.StringJoiner;
 
-public record AgentArguments(String host, int port, String token) {
+public record AgentArguments(String host, int port, String token, String minecraftVersion) {
+    public AgentArguments(String host, int port, String token) {
+        this(host, port, token, "");
+    }
+
     public String encode() {
         StringJoiner joiner = new StringJoiner(";");
         joiner.add("host=" + escape(host));
         joiner.add("port=" + port);
         joiner.add("token=" + escape(token));
+        joiner.add("minecraftVersion=" + escape(minecraftVersion == null ? "" : minecraftVersion));
         return joiner.toString();
     }
 
@@ -18,7 +23,8 @@ public record AgentArguments(String host, int port, String token) {
         String host = values.getOrDefault("host", "127.0.0.1");
         int port = Integer.parseInt(values.getOrDefault("port", "0"));
         String token = values.getOrDefault("token", "");
-        return new AgentArguments(host, port, token);
+        String minecraftVersion = values.getOrDefault("minecraftVersion", "");
+        return new AgentArguments(host, port, token, minecraftVersion);
     }
 
     public static Map<String, String> parseMap(String raw) {

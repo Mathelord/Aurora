@@ -3,8 +3,11 @@ package dev.aurora.injector;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.JComponent;
+import javax.swing.JComboBox;
+import javax.swing.DefaultListCellRenderer;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
+import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
@@ -14,6 +17,7 @@ import javax.swing.WindowConstants;
 import javax.swing.border.EmptyBorder;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.Font;
@@ -24,12 +28,14 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 import static dev.aurora.injector.SwingTheme.ACCENT;
 import static dev.aurora.injector.SwingTheme.ACCENT_HOVER;
 import static dev.aurora.injector.SwingTheme.BACKGROUND;
 import static dev.aurora.injector.SwingTheme.CARD;
 import static dev.aurora.injector.SwingTheme.CARD_HOVER;
+import static dev.aurora.injector.SwingTheme.CARD_BORDER;
 import static dev.aurora.injector.SwingTheme.DANGER;
 import static dev.aurora.injector.SwingTheme.MUTED_TEXT;
 import static dev.aurora.injector.SwingTheme.TEXT;
@@ -47,6 +53,11 @@ public final class InstanceLauncherGui extends JFrame {
     private static final int REFRESH_INTERVAL_MS = 2000;
     private static final int CARD_ARC = 16;
     private static final int CARD_HEIGHT = 76;
+    private static final String AUTO_VERSION = "Auto";
+    private static final String[] VERSION_MODES = {
+            AUTO_VERSION, "1.21.4", "1.21.11"
+    };
+    private static final Set<String> SUPPORTED_VERSIONS = Set.of("1.21.4", "1.21.11");
 
     private final ProcessDiscovery processDiscovery;
     private final AttachService attachService;
@@ -54,6 +65,7 @@ public final class InstanceLauncherGui extends JFrame {
     private final String token;
     private final JPanel listPanel = new JPanel();
     private final JLabel statusLabel = new JLabel(" ");
+    private String versionMode = AUTO_VERSION;
     private boolean injecting;
 
     public InstanceLauncherGui(ProcessDiscovery processDiscovery, AttachService attachService,
@@ -100,16 +112,19 @@ public final class InstanceLauncherGui extends JFrame {
     }
 
     private JPanel header() {
-        JPanel header = new JPanel();
-        header.setLayout(new BoxLayout(header, BoxLayout.Y_AXIS));
+        JPanel header = new JPanel(new BorderLayout(16, 0));
         header.setOpaque(false);
         header.setBorder(new EmptyBorder(26, 28, 18, 28));
+
+        JPanel branding = new JPanel();
+        branding.setLayout(new BoxLayout(branding, BoxLayout.Y_AXIS));
+        branding.setOpaque(false);
 
         JLabel wordmark = new JLabel("AURORA");
         wordmark.setForeground(TEXT);
         wordmark.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 24));
         wordmark.setAlignmentX(0f);
-        header.add(wordmark);
+        branding.add(wordmark);
 
         JPanel underline = new JPanel();
         underline.setBackground(ACCENT);
@@ -117,15 +132,60 @@ public final class InstanceLauncherGui extends JFrame {
         underline.setPreferredSize(new Dimension(40, 3));
         underline.setAlignmentX(0f);
         underline.setBorder(new EmptyBorder(6, 0, 10, 0));
-        header.add(underline);
+        branding.add(underline);
 
         JLabel subtitle = new JLabel("Select a Minecraft instance to inject into");
         subtitle.setForeground(MUTED_TEXT);
         subtitle.setFont(subtitle.getFont().deriveFont(13f));
         subtitle.setAlignmentX(0f);
-        header.add(subtitle);
+        branding.add(subtitle);
+        header.add(branding, BorderLayout.CENTER);
+
+        JComboBox<String> versionSelector = versionSelector();
+        JPanel modePanel = new JPanel();
+        modePanel.setLayout(new BoxLayout(modePanel, BoxLayout.Y_AXIS));
+        modePanel.setOpaque(false);
+
+        JLabel modeLabel = new JLabel("VERSION MODE");
+        modeLabel.setForeground(MUTED_TEXT);
+        modeLabel.setFont(modeLabel.getFont().deriveFont(Font.BOLD, 9.5f));
+        modeLabel.setAlignmentX(1f);
+        modeLabel.setLabelFor(versionSelector);
+        modePanel.add(modeLabel);
+        modePanel.add(spacer(5));
+        modePanel.add(versionSelector);
+        header.add(modePanel, BorderLayout.EAST);
 
         return header;
+    }
+
+    private JComboBox<String> versionSelector() {
+        JComboBox<String> selector = new JComboBox<>(VERSION_MODES);
+        selector.setSelectedItem(versionMode);
+        selector.setBackground(CARD);
+        selector.setForeground(TEXT);
+        selector.setFocusable(true);
+        selector.setMaximumSize(new Dimension(132, 34));
+        selector.setPreferredSize(new Dimension(132, 34));
+        selector.setBorder(BorderFactory.createLineBorder(CARD_BORDER));
+        selector.setToolTipText("Auto detects the instance version; selecting a version overrides the launcher display.");
+        selector.getAccessibleContext().setAccessibleName("Minecraft version mode");
+        selector.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                           boolean selected, boolean focused) {
+                Component component = super.getListCellRendererComponent(list, value, index, selected, focused);
+                component.setBackground(selected ? ACCENT : CARD);
+                component.setForeground(TEXT);
+                return component;
+            }
+        });
+        selector.addActionListener(event -> {
+            Object selected = selector.getSelectedItem();
+            versionMode = selected instanceof String value ? value : AUTO_VERSION;
+            refresh();
+        });
+        return selector;
     }
 
     private void refresh() {
@@ -190,19 +250,31 @@ public final class InstanceLauncherGui extends JFrame {
         JPanel text = new JPanel();
         text.setLayout(new BoxLayout(text, BoxLayout.Y_AXIS));
         text.setOpaque(false);
-        JLabel nameLabel = new JLabel("Minecraft  ·  PID " + process.pid());
+        String versionLabel = effectiveVersion(process)
+                .map(version -> "Minecraft " + version)
+                .orElse("Minecraft · Unknown version");
+        JLabel nameLabel = new JLabel(versionLabel + "  ·  PID " + process.pid());
         nameLabel.setForeground(TEXT);
         nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 14f));
         text.add(nameLabel);
-        JLabel detailLabel = new JLabel(loader.label + "  ·  " + truncate(process.displayName(), 46));
+        String modeDetail = AUTO_VERSION.equals(versionMode)
+                ? truncate(process.displayName(), 46)
+                : "Manual mode" + process.minecraftVersion().map(value -> " · detected " + value).orElse("");
+        JLabel detailLabel = new JLabel(loader.label + "  ·  " + modeDetail);
         detailLabel.setForeground(MUTED_TEXT);
         detailLabel.setFont(detailLabel.getFont().deriveFont(11.5f));
         detailLabel.setBorder(new EmptyBorder(3, 0, 0, 0));
         text.add(detailLabel);
         card.add(text, BorderLayout.CENTER);
 
-        SwingTheme.PillButton inject = new SwingTheme.PillButton("Inject", ACCENT, ACCENT_HOVER);
-        inject.setPreferredSize(new Dimension(88, 34));
+        boolean supported = effectiveVersion(process).map(SUPPORTED_VERSIONS::contains).orElse(false);
+        SwingTheme.PillButton inject = new SwingTheme.PillButton(supported ? "Inject" : "Unsupported",
+                ACCENT, ACCENT_HOVER);
+        inject.setPreferredSize(new Dimension(supported ? 88 : 112, 34));
+        inject.setEnabled(supported);
+        if (!supported) {
+            inject.setToolTipText("Aurora supports Minecraft 1.21.4 and 1.21.11.");
+        }
         inject.addActionListener(event -> inject(process));
         JPanel injectHolder = new JPanel();
         injectHolder.setOpaque(false);
@@ -222,11 +294,19 @@ public final class InstanceLauncherGui extends JFrame {
 
             @Override
             public void mouseClicked(MouseEvent event) {
-                inject(process);
+                if (supported) {
+                    inject(process);
+                }
             }
         });
 
         return card;
+    }
+
+    private java.util.Optional<String> effectiveVersion(JavaProcess process) {
+        return AUTO_VERSION.equals(versionMode)
+                ? process.minecraftVersion()
+                : java.util.Optional.of(versionMode);
     }
 
     private static String truncate(String text, int maxLength) {
@@ -237,6 +317,11 @@ public final class InstanceLauncherGui extends JFrame {
         if (injecting) {
             return;
         }
+        if (!effectiveVersion(process).map(SUPPORTED_VERSIONS::contains).orElse(false)) {
+            statusLabel.setForeground(DANGER);
+            statusLabel.setText("Unsupported Minecraft version. Select 1.21.4 or 1.21.11.");
+            return;
+        }
         injecting = true;
         statusLabel.setForeground(MUTED_TEXT);
         statusLabel.setText("Injecting into PID " + process.pid() + "...");
@@ -244,7 +329,9 @@ public final class InstanceLauncherGui extends JFrame {
         new SwingWorker<AttachService.AttachResult, Void>() {
             @Override
             protected AttachService.AttachResult doInBackground() {
-                return attachService.attach(process.pid(), new AgentArguments("127.0.0.1", agentHub.port(), token));
+                String minecraftVersion = effectiveVersion(process).orElse("");
+                return attachService.attach(process.pid(), new AgentArguments(
+                        "127.0.0.1", agentHub.port(), token, minecraftVersion));
             }
 
             @Override

@@ -3,11 +3,13 @@ package dev.aurora.modules;
 import dev.aurora.aim.Vec3;
 import dev.aurora.api.events.TickEvent;
 import dev.aurora.input.RealClickSimulator;
+import dev.aurora.minecraft.AimContext;
 import dev.aurora.minecraft.AimTarget;
 import dev.aurora.minecraft.CombatState;
 import dev.aurora.minecraft.MinecraftBridge;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -52,6 +54,34 @@ class TriggerBotModuleTest {
         module.onTick(TickEvent.now());
 
         assertEquals(0, bridge.attacks);
+        module.setEnabled(false);
+    }
+
+    @Test
+    void missesOnceWhenPlayerIsNearbyButOutsideCrosshair() {
+        FakeBridge bridge = new FakeBridge(Optional.empty(), 1.0D);
+        bridge.nearbyTargets = List.of(TARGET);
+        TriggerBotModule module = new TriggerBotModule(bridge);
+        set(module, "miss-chance", 100.0D);
+        module.setEnabled(true);
+
+        module.onTick(TickEvent.now());
+        module.onTick(TickEvent.now());
+
+        assertEquals(1, bridge.swings);
+        module.setEnabled(false);
+    }
+
+    @Test
+    void doesNotMissWithoutANearbyPlayer() {
+        FakeBridge bridge = new FakeBridge(Optional.empty(), 1.0D);
+        TriggerBotModule module = new TriggerBotModule(bridge);
+        set(module, "miss-chance", 100.0D);
+        module.setEnabled(true);
+
+        module.onTick(TickEvent.now());
+
+        assertEquals(0, bridge.swings);
         module.setEnabled(false);
     }
 
@@ -119,6 +149,8 @@ class TriggerBotModuleTest {
         private final double cooldown;
         private boolean leftMouseDown;
         private int attacks;
+        private int swings;
+        private List<AimTarget> nearbyTargets = List.of();
         private CombatState combatState = CombatState.unavailable();
 
         private FakeBridge(Optional<AimTarget> crosshairTarget, double cooldown) {
@@ -129,6 +161,11 @@ class TriggerBotModuleTest {
         @Override
         public Optional<AimTarget> crosshairEntity(double range) {
             return crosshairTarget;
+        }
+
+        @Override
+        public AimContext aimContext(double range, boolean ignoreWalls) {
+            return new AimContext(true, false, 0.0D, 0.0D, 0.5D, nearbyTargets);
         }
 
         @Override
@@ -144,6 +181,12 @@ class TriggerBotModuleTest {
         @Override
         public boolean doAttack() {
             attacks++;
+            return true;
+        }
+
+        @Override
+        public boolean swingMainHand() {
+            swings++;
             return true;
         }
 
@@ -176,5 +219,12 @@ class TriggerBotModuleTest {
         public String environment() {
             return "test";
         }
+    }
+
+    private static void set(TriggerBotModule module, String id, double value) {
+        module.settings().stream()
+                .filter(setting -> setting.id().equals(id))
+                .findFirst().orElseThrow()
+                .setValue(value);
     }
 }

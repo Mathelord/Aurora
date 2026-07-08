@@ -2,6 +2,8 @@ package dev.aurora.injector;
 
 import dev.aurora.util.Json;
 
+import javax.accessibility.AccessibleContext;
+import javax.accessibility.AccessibleRole;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -13,7 +15,9 @@ import javax.swing.JComponent;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JList;
+import javax.swing.JMenuItem;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JSlider;
 import javax.swing.JTextField;
@@ -50,6 +54,11 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.awt.geom.Arc2D;
 import java.awt.geom.Path2D;
+import java.awt.geom.RoundRectangle2D;
+import java.awt.image.BufferedImage;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URLConnection;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -58,7 +67,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.prefs.Preferences;
+import javax.imageio.ImageIO;
 
 import static dev.aurora.injector.SwingTheme.ACCENT;
 import static dev.aurora.injector.SwingTheme.BACKGROUND;
@@ -73,6 +84,7 @@ import static dev.aurora.injector.SwingTheme.TEXT;
 /** Desktop control surface for the injected agent. */
 public final class ControlPanelGui extends JFrame {
     private static final int POLL_INTERVAL_MS = 300;
+    private static final int RAINBOW_INTERVAL_MS = 40;
     private static final Color SIDEBAR = new Color(0x12, 0x11, 0x17);
     private static final Color TOPBAR = new Color(0x17, 0x16, 0x1D);
     private static final Color FIELD = new Color(0x24, 0x23, 0x2C);
@@ -80,12 +92,14 @@ public final class ControlPanelGui extends JFrame {
     private static final String FAVORITES = "Favorites";
     private static final String ALL = "All modules";
     private static final String SETTINGS = "Settings";
-    private static final String TARGET_RING = "Target Ring";
+    private static final String FRIENDS = "Friends";
     private static final String TARGET_RING_MODULE_ID = "target-ring";
 
     private final AgentConnectionHub agentHub;
     private final Preferences preferences = Preferences.userNodeForPackage(ControlPanelGui.class);
     private final Set<String> favorites = new LinkedHashSet<>();
+    private final Set<String> friends = new LinkedHashSet<>();
+    private final PlayerHeadCache headCache = new PlayerHeadCache();
     private final Set<String> expandedModules = new LinkedHashSet<>();
     private final JPanel navigationPanel = new JPanel();
     private final JPanel bottomNavigationPanel = new JPanel();
@@ -100,11 +114,15 @@ public final class ControlPanelGui extends JFrame {
     private final SwingTheme.PillButton uninjectButton =
             new SwingTheme.PillButton("Uninject", DANGER, DANGER_HOVER);
     private final Timer pollTimer;
+    private final Timer rainbowTimer;
+    private final List<RainbowCard> rainbowCards = new ArrayList<>();
+    private float rainbowPhase;
 
     private List<ModuleView> modules = List.of();
+    private List<String> onlinePlayers = List.of();
     private String selectedCategory = ALL;
     private String lastModulesJson = "";
-    private String lastEventSampleJson = "";
+    private String lastSampleJson = "";
     private String bindingModuleId;
     private boolean pointerInteraction;
     private boolean uninjectRequested;
@@ -114,6 +132,7 @@ public final class ControlPanelGui extends JFrame {
         this.agentHub = agentHub;
         SwingTheme.setAccent(GuiPreferences.accentColor());
         loadFavorites();
+        friends.addAll(GuiPreferences.friends());
         ToolTipManager.sharedInstance().setInitialDelay(0);
         ToolTipManager.sharedInstance().setReshowDelay(0);
         ToolTipManager.sharedInstance().setDismissDelay(12_000);
@@ -128,14 +147,15 @@ public final class ControlPanelGui extends JFrame {
         add(topBar(), BorderLayout.NORTH);
         add(sidebar(), BorderLayout.WEST);
         add(content(), BorderLayout.CENTER);
-        add(footer(), BorderLayout.SOUTH);
 
         pollTimer = new Timer(POLL_INTERVAL_MS, event -> poll());
         pollTimer.start();
+        rainbowTimer = new Timer(RAINBOW_INTERVAL_MS, event -> tickRainbow());
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosed(WindowEvent event) {
                 pollTimer.stop();
+                rainbowTimer.stop();
             }
         });
         poll();
@@ -199,7 +219,7 @@ public final class ControlPanelGui extends JFrame {
         hint.setForeground(MUTED_TEXT);
         hint.setFont(hint.getFont().deriveFont(SwingTheme.scaleFont(10.5f)));
         hint.setBorder(new EmptyBorder(SwingTheme.scale(8), SwingTheme.scale(0), SwingTheme.scale(0), SwingTheme.scale(0)));
-        bottomNavigationPanel.add(navigationButton("◎  " + TARGET_RING, TARGET_RING));
+        bottomNavigationPanel.add(navigationButton("☺  " + FRIENDS, FRIENDS));
         bottomNavigationPanel.add(Box.createVerticalStrut(SwingTheme.scale(5)));
         bottomNavigationPanel.add(navigationButton("⚙  " + SETTINGS, SETTINGS));
         bottomNavigationPanel.add(hint);
@@ -237,19 +257,6 @@ public final class ControlPanelGui extends JFrame {
         return content;
     }
 
-    private JComponent footer() {
-        JPanel footer = new JPanel(new BorderLayout());
-        footer.setBackground(TOPBAR);
-        footer.setBorder(new EmptyBorder(SwingTheme.scale(7), SwingTheme.scale(24), SwingTheme.scale(7), SwingTheme.scale(24)));
-        statusLabel.setForeground(MUTED_TEXT);
-        statusLabel.setFont(statusLabel.getFont().deriveFont(SwingTheme.scaleFont(11f)));
-        footer.add(statusLabel, BorderLayout.WEST);
-        footerHelpLabel.setForeground(MUTED_TEXT);
-        footerHelpLabel.setFont(footerHelpLabel.getFont().deriveFont(SwingTheme.scaleFont(10.5f)));
-        footer.add(footerHelpLabel, BorderLayout.EAST);
-        return footer;
-    }
-
     private void rebuildNavigation() {
         navigationPanel.removeAll();
         JLabel heading = new JLabel("LIBRARY");
@@ -283,7 +290,7 @@ public final class ControlPanelGui extends JFrame {
         if (bottomNavigationPanel.getComponentCount() == 0) return;
         Component hint = bottomNavigationPanel.getComponent(bottomNavigationPanel.getComponentCount() - 1);
         bottomNavigationPanel.removeAll();
-        bottomNavigationPanel.add(navigationButton("◎  " + TARGET_RING, TARGET_RING));
+        bottomNavigationPanel.add(navigationButton("☺  " + FRIENDS, FRIENDS));
         bottomNavigationPanel.add(Box.createVerticalStrut(SwingTheme.scale(5)));
         bottomNavigationPanel.add(navigationButton("⚙  " + SETTINGS, SETTINGS));
         bottomNavigationPanel.add(hint);
@@ -292,26 +299,17 @@ public final class ControlPanelGui extends JFrame {
     }
 
     private JButton navigationButton(String text, String category) {
-        JButton button = new JButton(text);
         boolean selected = category.equals(selectedCategory);
-        button.setHorizontalAlignment(SwingConstants.LEFT);
-        button.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
-        button.setPreferredSize(new Dimension(SwingTheme.scale(150), SwingTheme.scale(38)));
-        button.setBackground(selected ? FIELD : SIDEBAR);
-        button.setForeground(selected ? TEXT : MUTED_TEXT);
-        button.setFont(button.getFont().deriveFont(selected ? Font.BOLD : Font.PLAIN, SwingTheme.scaleFont(13f)));
-        button.setFocusPainted(false);
-        button.setBorder(new EmptyBorder(SwingTheme.scale(0), SwingTheme.scale(10), SwingTheme.scale(0), SwingTheme.scale(10)));
-        button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        NavButton button = new NavButton(text, selected);
         button.addActionListener(event -> {
             selectedCategory = category;
             pageTitle.setText(category);
-            boolean dedicated = SETTINGS.equals(category) || TARGET_RING.equals(category);
+            boolean dedicated = SETTINGS.equals(category) || FRIENDS.equals(category);
             searchField.setEnabled(!dedicated);
             footerHelpLabel.setText(SETTINGS.equals(category)
                     ? "Appearance changes are saved automatically"
-                    : TARGET_RING.equals(category)
-                    ? "The ring shows around Silent Aura's target while Silent Aura is on"
+                    : FRIENDS.equals(category)
+                    ? "Friends are ignored by combat modules and shown in the ESP friend color"
                     : "Enter applies values  ·  Backspace/Delete clears a keybind");
             rebuildNavigation();
             rebuildModuleList();
@@ -321,29 +319,44 @@ public final class ControlPanelGui extends JFrame {
 
     private void poll() {
         updateConnectionStatus();
+        updateOnlinePlayers();
         if (isEditing()) {
             return;
         }
         String modulesJson = agentHub.modulesJson();
-        String eventSampleJson = agentHub.eventSampleJson();
-        boolean modulesChanged = !modulesJson.equals(lastModulesJson);
-        boolean sampleChanged = !eventSampleJson.equals(lastEventSampleJson);
-        if (!modulesChanged && !sampleChanged) {
+        if (modulesJson.equals(lastModulesJson)) {
             return;
         }
         try {
-            if (modulesChanged) {
-                modules = parseModules(modulesJson);
-                lastModulesJson = modulesJson;
-                rebuildNavigation();
-            }
-            lastEventSampleJson = eventSampleJson;
-            if (modulesChanged || SETTINGS.equals(selectedCategory)) {
-                rebuildModuleList();
-            }
+            modules = parseModules(modulesJson);
+            lastModulesJson = modulesJson;
+            rebuildNavigation();
+            rebuildModuleList();
         } catch (IllegalArgumentException exception) {
             showStatus("Could not read module data: " + exception.getMessage(), true);
         }
+    }
+
+    private void updateOnlinePlayers() {
+        String sampleJson = agentHub.eventSampleJson();
+        if (sampleJson.equals(lastSampleJson)) {
+            return;
+        }
+        lastSampleJson = sampleJson;
+        List<String> names = new ArrayList<>();
+        try {
+            if (Json.parse(sampleJson) instanceof Map<?, ?> sample
+                    && sample.get("onlinePlayers") instanceof List<?> players) {
+                for (Object player : players) {
+                    if (player instanceof String name && !name.isBlank()) {
+                        names.add(name);
+                    }
+                }
+            }
+        } catch (IllegalArgumentException ignored) {
+            return;
+        }
+        onlinePlayers = names;
     }
 
     private void updateConnectionStatus() {
@@ -355,7 +368,9 @@ public final class ControlPanelGui extends JFrame {
             boolean attached = Boolean.TRUE.equals(status.get("attached"));
             Object rawMessage = status.get("message");
             String message = rawMessage == null ? "Unknown status" : String.valueOf(rawMessage);
-            connectionLabel.setText((attached ? "●  " : "○  ") + message);
+            // Show a stable connection state instead of echoing transient agent messages like
+            // "Updated module esp" or "Agent active".
+            connectionLabel.setText((attached ? "●  Connected" : "○  " + message));
             connectionLabel.setForeground(attached ? SUCCESS : DANGER);
             if (uninjectRequested && !attached) {
                 uninjectButton.setText("Uninjected");
@@ -380,12 +395,13 @@ public final class ControlPanelGui extends JFrame {
         if (listPanel == null) {
             return;
         }
+        stopRainbowAnimation();
         if (SETTINGS.equals(selectedCategory)) {
             rebuildSettingsPage();
             return;
         }
-        if (TARGET_RING.equals(selectedCategory)) {
-            rebuildTargetRingPage();
+        if (FRIENDS.equals(selectedCategory)) {
+            rebuildFriendsPage();
             return;
         }
         String query = searchField.getText().strip().toLowerCase(Locale.ROOT);
@@ -399,14 +415,59 @@ public final class ControlPanelGui extends JFrame {
         if (visible.isEmpty()) {
             listPanel.add(emptyState(query));
         } else {
-            for (ModuleView module : visible) {
-                listPanel.add(moduleCard(module));
+            for (int index = 0; index < visible.size(); index++) {
+                listPanel.add(moduleCard(visible.get(index), index, visible.size()));
                 listPanel.add(Box.createVerticalStrut(SwingTheme.scale(10)));
             }
         }
         resultCount.setText(visible.size() + (visible.size() == 1 ? " module" : " modules"));
         listPanel.revalidate();
         listPanel.repaint();
+        if (!rainbowCards.isEmpty()) {
+            rainbowTimer.start();
+        }
+    }
+
+    private void stopRainbowAnimation() {
+        if (rainbowTimer != null) {
+            rainbowTimer.stop();
+        }
+        rainbowCards.clear();
+    }
+
+    /** Advances the rainbow animation one step and recolors every enrolled module card from the shared
+     * phase. All cards are recolored together (not just the visible ones) so the rainbow is one
+     * continuous flow anchored to the whole list — the first module is the start of the spectrum and
+     * the last is the end — and scrolling simply reveals more of it instead of re-tinting whatever
+     * card sits at the top of the viewport. Off-screen repaints are clipped away, and the flat card
+     * fills are cheap, so recoloring all of them stays smooth while scrolling. */
+    private void tickRainbow() {
+        if (rainbowCards.isEmpty()) {
+            return;
+        }
+        rainbowPhase += 0.02f;
+        if (rainbowPhase >= 1f) {
+            rainbowPhase -= 1f;
+        }
+        for (RainbowCard card : rainbowCards) {
+            Color color = rainbowColor(card.position, rainbowPhase, card.enabled);
+            card.panel.setBackgroundColor(card.hovered ? SwingTheme.lighten(color, 0.12D) : color);
+        }
+    }
+
+    /** A module card enrolled in the rainbow animation, remembering its fixed position in the list so
+     * its hue can be recomputed each frame from the shared phase. */
+    private static final class RainbowCard {
+        private final SwingTheme.RoundedPanel panel;
+        private final float position;
+        private final boolean enabled;
+        private boolean hovered;
+
+        private RainbowCard(SwingTheme.RoundedPanel panel, float position, boolean enabled) {
+            this.panel = panel;
+            this.position = position;
+            this.enabled = enabled;
+        }
     }
 
     private void rebuildSettingsPage() {
@@ -414,10 +475,89 @@ public final class ControlPanelGui extends JFrame {
         listPanel.removeAll();
         listPanel.add(appearanceCard());
         listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
-        listPanel.add(scaleCard());
+        listPanel.add(silentAimCard());
         listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
-        listPanel.add(diagnosticsCard());
-        finishDedicatedPageRebuild(SETTINGS, "Appearance & diagnostics");
+        listPanel.add(targetRingSettingsCard());
+        listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
+        listPanel.add(scaleCard());
+        finishDedicatedPageRebuild(SETTINGS, "Appearance, aim, ring & scale");
+    }
+
+    private JComponent targetRingSettingsCard() {
+        ModuleView ring = modules.stream()
+                .filter(module -> TARGET_RING_MODULE_ID.equals(module.id()))
+                .findFirst()
+                .orElse(null);
+        return ring == null ? targetRingUnavailable() : targetRingCard(ring);
+    }
+
+    private JComponent silentAimCard() {
+        SwingTheme.RoundedPanel card = new SwingTheme.RoundedPanel(16, CARD);
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setBorder(new EmptyBorder(SwingTheme.scale(22), SwingTheme.scale(24),
+                SwingTheme.scale(22), SwingTheme.scale(24)));
+        card.setAlignmentX(0f);
+
+        JLabel title = new JLabel("Silent Aim");
+        title.setForeground(TEXT);
+        title.setFont(title.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(16f)));
+        title.setAlignmentX(0f);
+        card.add(title);
+
+        JLabel description = new JLabel("Global visual feedback shared by every feature that uses silent aim.");
+        description.setForeground(MUTED_TEXT);
+        description.setFont(description.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
+        description.setBorder(new EmptyBorder(SwingTheme.scale(5), 0, SwingTheme.scale(18), 0));
+        description.setAlignmentX(0f);
+        card.add(description);
+
+        JPanel row = new JPanel(new BorderLayout(SwingTheme.scale(14), 0));
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+        row.setAlignmentX(0f);
+        JLabel label = new JLabel("Crosshair direction line");
+        label.setForeground(TEXT);
+        label.setFont(label.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(12.5f)));
+        label.setPreferredSize(new Dimension(SwingTheme.scale(185), SwingTheme.scale(34)));
+        label.setToolTipText("Shows where the active decoupled silent aim is looking.");
+        row.add(label, BorderLayout.WEST);
+
+        SwingTheme.ToggleSwitch toggle = new SwingTheme.ToggleSwitch(GuiPreferences.silentAimCrosshairIndicator());
+        toggle.onChange(enabled -> {
+            GuiPreferences.setSilentAimCrosshairIndicator(enabled);
+            if (!agentHub.sendGlobalSettings(enabled)) {
+                showStatus("Saved; it will apply when an agent connects.", false);
+            } else {
+                showStatus("Silent Aim crosshair line " + (enabled ? "enabled" : "disabled"), false);
+            }
+        });
+        markInteractive(toggle);
+        JPanel holder = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, SwingTheme.scale(7)));
+        holder.setOpaque(false);
+        holder.add(toggle);
+        row.add(holder, BorderLayout.CENTER);
+        card.add(row);
+
+        int contentHeight = card.getPreferredSize().height;
+        card.setPreferredSize(new Dimension(SwingTheme.scale(10), contentHeight));
+        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
+        return card;
+    }
+
+    /** Rebuilds the whole window from scratch so a changed {@link UiScale} factor takes effect right
+     * away instead of only after the panel is reopened: every panel recomputes its sizes and fonts
+     * from {@code SwingTheme.scale(...)} as it is rebuilt. */
+    private void applyScaleLive() {
+        stopRainbowAnimation();
+        getContentPane().removeAll();
+        add(topBar(), BorderLayout.NORTH);
+        add(sidebar(), BorderLayout.WEST);
+        add(content(), BorderLayout.CENTER);
+        setMinimumSize(new Dimension(SwingTheme.scale(760), SwingTheme.scale(520)));
+        rebuildNavigation();
+        rebuildModuleList();
+        getContentPane().revalidate();
+        getContentPane().repaint();
     }
 
     private void finishDedicatedPageRebuild(String title, String count) {
@@ -453,7 +593,7 @@ public final class ControlPanelGui extends JFrame {
 
         JLabel description = new JLabel(
                 "Scales module cards, text and controls up for high-resolution displays. "
-                        + "Applies the next time this window opens.");
+                        + "Applies immediately.");
         description.setForeground(MUTED_TEXT);
         description.setFont(description.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
         description.setBorder(new EmptyBorder(SwingTheme.scale(5), 0, SwingTheme.scale(18), 0));
@@ -488,7 +628,8 @@ public final class ControlPanelGui extends JFrame {
             scaleSlider.setToolTipText(percent + "%");
             if (!scaleSlider.getValueIsAdjusting()) {
                 UiScale.setFactor(percent / 100.0D);
-                showStatus("GUI scale set to " + percent + "%. Restart the control panel to apply it.", false);
+                showStatus("GUI scale set to " + percent + "%", false);
+                SwingUtilities.invokeLater(this::applyScaleLive);
             }
         });
         JPanel scaleEditor = new JPanel(new BorderLayout(SwingTheme.scale(10), 0));
@@ -504,99 +645,29 @@ public final class ControlPanelGui extends JFrame {
         return card;
     }
 
-    private JComponent diagnosticsCard() {
+    private JComponent targetRingUnavailable() {
         SwingTheme.RoundedPanel card = new SwingTheme.RoundedPanel(16, CARD);
         card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
-        card.setBorder(new EmptyBorder(SwingTheme.scale(20), SwingTheme.scale(24), SwingTheme.scale(20), SwingTheme.scale(24)));
+        card.setBorder(new EmptyBorder(SwingTheme.scale(22), SwingTheme.scale(24), SwingTheme.scale(22), SwingTheme.scale(24)));
         card.setAlignmentX(0f);
 
-        JLabel title = new JLabel("Runtime diagnostics");
+        JLabel title = new JLabel("Target Ring");
         title.setForeground(TEXT);
         title.setFont(title.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(16f)));
         title.setAlignmentX(0f);
         card.add(title);
 
-        Map<?, ?> sample = diagnosticSample();
-        long ticks = sampleLong(sample, "ticks");
-        long hud = sampleLong(sample, "hudRenders");
-        long world = sampleLong(sample, "worldRenders");
-        long renderFailures = sampleLong(sample, "worldRenderFailures");
-        long inbound = sampleLong(sample, "inboundPackets");
-        long outbound = sampleLong(sample, "outboundPackets");
-        long heldInbound = sampleLong(sample, "heldInbound");
-        long heldOutbound = sampleLong(sample, "heldOutbound");
-        long latency = sampleLong(sample, "inboundLatencyMs");
-
-        JLabel hooks = new JLabel("Ticks " + ticks + "   ·   HUD " + hud + "   ·   3D " + world
-                + "   ·   Render failures " + renderFailures);
-        hooks.setForeground(ticks > 0 && hud > 0 && world > 0 && renderFailures == 0 ? SUCCESS : DANGER);
-        hooks.setFont(hooks.getFont().deriveFont(SwingTheme.scaleFont(12f)));
-        hooks.setBorder(new EmptyBorder(SwingTheme.scale(10), SwingTheme.scale(0), SwingTheme.scale(5), SwingTheme.scale(0)));
-        hooks.setAlignmentX(0f);
-        card.add(hooks);
-
-        JLabel network = new JLabel("Inbound " + inbound + "   ·   Outbound " + outbound
-                + "   ·   Held " + heldInbound + "/" + heldOutbound + "   ·   Lag " + latency + " ms");
-        network.setForeground(MUTED_TEXT);
-        network.setFont(network.getFont().deriveFont(SwingTheme.scaleFont(12f)));
-        network.setAlignmentX(0f);
-        card.add(network);
-
-        Object errorValue = sample.get("lastError");
-        String error = errorValue == null ? "" : String.valueOf(errorValue);
-        JLabel lastError = new JLabel(error.isBlank() ? "No runtime errors reported."
-                : "<html>Last error: " + escapeHtml(error) + "</html>");
-        lastError.setForeground(error.isBlank() ? SUCCESS : DANGER);
-        lastError.setFont(lastError.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
-        lastError.setBorder(new EmptyBorder(SwingTheme.scale(8), SwingTheme.scale(0), SwingTheme.scale(0), SwingTheme.scale(0)));
-        lastError.setAlignmentX(0f);
-        card.add(lastError);
-
-        int height = card.getPreferredSize().height;
-        card.setPreferredSize(new Dimension(SwingTheme.scale(10), height));
-        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, height));
-        return card;
-    }
-
-    private Map<?, ?> diagnosticSample() {
-        try {
-            Object parsed = Json.parse(agentHub.eventSampleJson());
-            return parsed instanceof Map<?, ?> map ? map : Map.of();
-        } catch (IllegalArgumentException ignored) {
-            return Map.of();
-        }
-    }
-
-    private static long sampleLong(Map<?, ?> sample, String key) {
-        Object value = sample.get(key);
-        return value instanceof Number number ? number.longValue() : 0L;
-    }
-
-    private void rebuildTargetRingPage() {
-        listPanel.setVisible(false);
-        listPanel.removeAll();
-        ModuleView ring = modules.stream()
-                .filter(module -> TARGET_RING_MODULE_ID.equals(module.id()))
-                .findFirst()
-                .orElse(null);
-        if (ring == null) {
-            listPanel.add(targetRingUnavailable());
-            finishDedicatedPageRebuild(TARGET_RING, TARGET_RING);
-        } else {
-            listPanel.add(targetRingCard(ring));
-            finishDedicatedPageRebuild(TARGET_RING, ring.enabled() ? "Enabled" : "Disabled");
-        }
-    }
-
-    private JComponent targetRingUnavailable() {
-        JPanel empty = new JPanel();
-        empty.setOpaque(false);
-        empty.setBorder(new EmptyBorder(SwingTheme.scale(70), SwingTheme.scale(20), SwingTheme.scale(20), SwingTheme.scale(20)));
         JLabel text = new JLabel("Connect the agent to configure the target ring.");
         text.setForeground(MUTED_TEXT);
-        text.setFont(text.getFont().deriveFont(SwingTheme.scaleFont(13f)));
-        empty.add(text);
-        return empty;
+        text.setFont(text.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
+        text.setBorder(new EmptyBorder(SwingTheme.scale(5), 0, 0, 0));
+        text.setAlignmentX(0f);
+        card.add(text);
+
+        int contentHeight = card.getPreferredSize().height;
+        card.setPreferredSize(new Dimension(SwingTheme.scale(10), contentHeight));
+        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
+        return card;
     }
 
     private JComponent targetRingCard(ModuleView ring) {
@@ -649,6 +720,185 @@ public final class ControlPanelGui extends JFrame {
         card.setPreferredSize(new Dimension(SwingTheme.scale(10), contentHeight));
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
         return card;
+    }
+
+    private void rebuildFriendsPage() {
+        listPanel.setVisible(false);
+        listPanel.removeAll();
+        listPanel.add(friendsCard());
+        finishDedicatedPageRebuild(FRIENDS, friends.size() + (friends.size() == 1 ? " friend" : " friends"));
+    }
+
+    private JComponent friendsCard() {
+        SwingTheme.RoundedPanel card = new SwingTheme.RoundedPanel(16, CARD);
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setBorder(new EmptyBorder(SwingTheme.scale(22), SwingTheme.scale(24), SwingTheme.scale(22), SwingTheme.scale(24)));
+        card.setAlignmentX(0f);
+
+        JLabel title = new JLabel("Friends");
+        title.setForeground(TEXT);
+        title.setFont(title.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(16f)));
+        title.setAlignmentX(0f);
+        card.add(title);
+
+        JLabel description = new JLabel("<html>Friended players are never targeted by combat modules "
+                + "(Silent Aura, Auto Anchor, Aim Assist, TriggerBot…) and are drawn in the ESP friend "
+                + "color instead of the normal box color.</html>");
+        description.setForeground(MUTED_TEXT);
+        description.setFont(description.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
+        description.setBorder(new EmptyBorder(SwingTheme.scale(5), 0, SwingTheme.scale(18), 0));
+        description.setAlignmentX(0f);
+        card.add(description);
+
+        JPanel addRow = new JPanel(new BorderLayout(SwingTheme.scale(9), 0));
+        addRow.setOpaque(false);
+        addRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+        addRow.setAlignmentX(0f);
+        JTextField nameField = new JTextField();
+        styleValueField(nameField);
+        nameField.setHorizontalAlignment(SwingConstants.LEFT);
+        markInteractive(nameField);
+        SwingTheme.PillButton addButton = new SwingTheme.PillButton("Add", SwingTheme.ACCENT, SwingTheme.ACCENT_HOVER);
+        addButton.setPreferredSize(new Dimension(SwingTheme.scale(76), SwingTheme.scale(34)));
+        JPopupMenu suggestions = new JPopupMenu();
+        suggestions.setFocusable(false);
+        suggestions.setBorder(BorderFactory.createLineBorder(CARD_BORDER));
+        Runnable addAction = () -> {
+            suggestions.setVisible(false);
+            if (addFriend(nameField.getText())) {
+                nameField.setText("");
+                rebuildFriendsPage();
+            }
+        };
+        nameField.addActionListener(event -> addAction.run());
+        addButton.addActionListener(event -> addAction.run());
+        nameField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent event) { updateSuggestions(nameField, suggestions); }
+            @Override public void removeUpdate(DocumentEvent event) { updateSuggestions(nameField, suggestions); }
+            @Override public void changedUpdate(DocumentEvent event) { updateSuggestions(nameField, suggestions); }
+        });
+        addRow.add(nameField, BorderLayout.CENTER);
+        addRow.add(addButton, BorderLayout.EAST);
+        card.add(addRow);
+        card.add(Box.createVerticalStrut(SwingTheme.scale(16)));
+
+        if (friends.isEmpty()) {
+            JLabel empty = new JLabel("No friends added yet.");
+            empty.setForeground(MUTED_TEXT);
+            empty.setFont(empty.getFont().deriveFont(SwingTheme.scaleFont(12f)));
+            empty.setAlignmentX(0f);
+            card.add(empty);
+        } else {
+            for (String friend : friends) {
+                card.add(friendRow(friend));
+                card.add(Box.createVerticalStrut(SwingTheme.scale(8)));
+            }
+        }
+
+        int contentHeight = card.getPreferredSize().height;
+        card.setPreferredSize(new Dimension(SwingTheme.scale(10), contentHeight));
+        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
+        return card;
+    }
+
+    private JComponent friendRow(String friend) {
+        JPanel row = new JPanel(new BorderLayout(SwingTheme.scale(12), 0));
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(40)));
+        row.setAlignmentX(0f);
+
+        JPanel identity = new JPanel(new FlowLayout(FlowLayout.LEFT, SwingTheme.scale(10), 0));
+        identity.setOpaque(false);
+        identity.add(new PlayerHead(friend, SwingTheme.scale(28), headCache));
+        JLabel name = new JLabel(friend);
+        name.setForeground(TEXT);
+        name.setFont(name.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(13f)));
+        identity.add(name);
+        row.add(identity, BorderLayout.WEST);
+
+        SwingTheme.PillButton remove = new SwingTheme.PillButton("Remove", DANGER, DANGER_HOVER);
+        remove.setPreferredSize(new Dimension(SwingTheme.scale(88), SwingTheme.scale(32)));
+        remove.addActionListener(event -> {
+            removeFriend(friend);
+            rebuildFriendsPage();
+        });
+        JPanel removeHolder = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, SwingTheme.scale(4)));
+        removeHolder.setOpaque(false);
+        removeHolder.add(remove);
+        row.add(removeHolder, BorderLayout.EAST);
+        return row;
+    }
+
+    /** Shows up to eight online-player suggestions once at least three characters are typed, like a
+     * shell tab-completion. Selecting one fills the field so the user can review it before adding. */
+    private void updateSuggestions(JTextField nameField, JPopupMenu suggestions) {
+        String query = nameField.getText().strip().toLowerCase(Locale.ROOT);
+        if (query.length() < 3) {
+            suggestions.setVisible(false);
+            return;
+        }
+        List<String> matches = onlinePlayers.stream()
+                .filter(name -> name.toLowerCase(Locale.ROOT).contains(query))
+                .filter(name -> friends.stream().noneMatch(friend -> friend.equalsIgnoreCase(name)))
+                .distinct()
+                .limit(8)
+                .toList();
+        if (matches.isEmpty()) {
+            suggestions.setVisible(false);
+            return;
+        }
+        suggestions.removeAll();
+        for (String name : matches) {
+            JMenuItem item = new JMenuItem(name, new PlayerHeadIcon(name, SwingTheme.scale(18), headCache));
+            item.setBackground(FIELD);
+            item.setForeground(TEXT);
+            item.setOpaque(true);
+            item.setIconTextGap(SwingTheme.scale(8));
+            item.addActionListener(event -> {
+                suggestions.setVisible(false);
+                nameField.setText(name);
+                nameField.requestFocusInWindow();
+            });
+            suggestions.add(item);
+        }
+        suggestions.pack();
+        suggestions.show(nameField, 0, nameField.getHeight());
+        nameField.requestFocusInWindow();
+    }
+
+    private boolean addFriend(String rawName) {
+        String name = rawName == null ? "" : rawName.strip();
+        if (name.isEmpty()) {
+            showStatus("Enter a player name to add as a friend.", true);
+            return false;
+        }
+        if (!name.matches("[A-Za-z0-9_]{1,16}")) {
+            showStatus("\"" + name + "\" is not a valid Minecraft username.", true);
+            return false;
+        }
+        boolean exists = friends.stream().anyMatch(existing -> existing.equalsIgnoreCase(name));
+        if (exists) {
+            showStatus(name + " is already a friend.", false);
+            return false;
+        }
+        friends.add(name);
+        persistAndPushFriends();
+        showStatus("Added " + name + " to friends.", false);
+        return true;
+    }
+
+    private void removeFriend(String name) {
+        friends.removeIf(existing -> existing.equalsIgnoreCase(name));
+        persistAndPushFriends();
+        showStatus("Removed " + name + " from friends.", false);
+    }
+
+    private void persistAndPushFriends() {
+        List<String> ordered = new ArrayList<>(friends);
+        GuiPreferences.setFriends(ordered);
+        if (!agentHub.sendFriends(ordered)) {
+            showStatus("Saved; friends will sync when an agent connects.", false);
+        }
     }
 
     private JComponent appearanceCard() {
@@ -727,7 +977,31 @@ public final class ControlPanelGui extends JFrame {
             presets.add(swatch);
         }
         card.add(presets);
-        card.add(Box.createVerticalStrut(SwingTheme.scale(20)));
+        card.add(Box.createVerticalStrut(SwingTheme.scale(18)));
+
+        JPanel rainbowRow = new JPanel(new BorderLayout(SwingTheme.scale(14), SwingTheme.scale(0)));
+        rainbowRow.setOpaque(false);
+        rainbowRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+        rainbowRow.setAlignmentX(0f);
+        JLabel rainbowLabel = new JLabel("Rainbow modules");
+        rainbowLabel.setForeground(TEXT);
+        rainbowLabel.setFont(rainbowLabel.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(12.5f)));
+        rainbowLabel.setToolTipText("Paints the module cards as a top-to-bottom rainbow gradient instead of the accent color.");
+        rainbowLabel.setPreferredSize(new Dimension(SwingTheme.scale(150), SwingTheme.scale(34)));
+        rainbowRow.add(rainbowLabel, BorderLayout.WEST);
+        SwingTheme.ToggleSwitch rainbowToggle = new SwingTheme.ToggleSwitch(GuiPreferences.rainbowModules());
+        rainbowToggle.setToolTipText("Paints the module cards as a top-to-bottom rainbow gradient instead of the accent color.");
+        rainbowToggle.onChange(value -> {
+            GuiPreferences.setRainbowModules(value);
+            showStatus(value ? "Rainbow module colors enabled" : "Rainbow module colors disabled", false);
+        });
+        markInteractive(rainbowToggle);
+        JPanel rainbowHolder = new JPanel(new FlowLayout(FlowLayout.LEFT, SwingTheme.scale(0), SwingTheme.scale(7)));
+        rainbowHolder.setOpaque(false);
+        rainbowHolder.add(rainbowToggle);
+        rainbowRow.add(rainbowHolder, BorderLayout.CENTER);
+        card.add(rainbowRow);
+        card.add(Box.createVerticalStrut(SwingTheme.scale(18)));
 
         JButton reset = new JButton("Reset appearance");
         styleSmallButton(reset);
@@ -770,13 +1044,35 @@ public final class ControlPanelGui extends JFrame {
         return empty;
     }
 
-    private JComponent moduleCard(ModuleView module) {
+    /** Maps a vertical position in [0, 1] down the module list, plus an animation {@code phase}, to a
+     * rainbow color: enabled cards get a bright, saturated hue, disabled cards a dark muted one so the
+     * flow stays visible but the enabled modules still stand out. Each card is a flat fill (not a
+     * gradient) so the list paints as cheaply as a normal module list and scrolling stays smooth; the
+     * top-to-bottom rainbow reads from the per-card hue steps. */
+    private static Color rainbowColor(float position, float phase, boolean enabled) {
+        float hue = position * 0.82f + phase;
+        return enabled ? Color.getHSBColor(hue, 0.60f, 0.92f) : Color.getHSBColor(hue, 0.15f, 0.28f);
+    }
+
+    private JComponent moduleCard(ModuleView module, int index, int total) {
         boolean expanded = expandedModules.contains(module.id());
-        Color cardColor = module.enabled() ? SwingTheme.ACCENT : CARD;
-        Color hoverColor = module.enabled() ? SwingTheme.ACCENT_HOVER : CARD_HOVER;
+        boolean rainbow = GuiPreferences.rainbowModules();
+        final Color cardColor;
+        final Color hoverColor;
+        final float rainbowPos = total <= 1 ? 0f : index / (float) (total - 1);
+        if (rainbow) {
+            cardColor = rainbowColor(rainbowPos, rainbowPhase, module.enabled());
+            hoverColor = SwingTheme.lighten(cardColor, 0.12D);
+        } else {
+            cardColor = module.enabled() ? SwingTheme.ACCENT : CARD;
+            hoverColor = module.enabled() ? SwingTheme.ACCENT_HOVER : CARD_HOVER;
+        }
+        boolean colored = rainbow || module.enabled();
         Color activeText = SwingTheme.contrastText(cardColor);
         Color activeMutedText = SwingTheme.contrastMuted(cardColor);
         SwingTheme.RoundedPanel card = new SwingTheme.RoundedPanel(16, cardColor);
+        final RainbowCard rainbowCard = rainbow ? new RainbowCard(card, rainbowPos, module.enabled()) : null;
+        if (rainbowCard != null) rainbowCards.add(rainbowCard);
         card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
         card.setBorder(new EmptyBorder(SwingTheme.scale(0), SwingTheme.scale(0), SwingTheme.scale(expanded ? 14 : 0), SwingTheme.scale(0)));
         card.setAlignmentX(0f);
@@ -789,7 +1085,7 @@ public final class ControlPanelGui extends JFrame {
         summary.setAlignmentX(Component.LEFT_ALIGNMENT);
         summary.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
-        JButton favorite = new FavoriteButton(favorites.contains(module.id()), module.enabled());
+        JButton favorite = new FavoriteButton(favorites.contains(module.id()), colored, activeText);
         favorite.setToolTipText("Toggle favorite");
         favorite.addActionListener(event -> toggleFavorite(module.id()));
         summary.add(favorite, BorderLayout.WEST);
@@ -797,13 +1093,22 @@ public final class ControlPanelGui extends JFrame {
         JPanel identity = new JPanel();
         identity.setLayout(new BoxLayout(identity, BoxLayout.Y_AXIS));
         identity.setOpaque(false);
+        JPanel nameRow = new JPanel();
+        nameRow.setLayout(new BoxLayout(nameRow, BoxLayout.X_AXIS));
+        nameRow.setOpaque(false);
+        nameRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         JLabel name = new JLabel(module.displayName());
-        name.setForeground(module.enabled() ? activeText : TEXT);
+        name.setForeground(colored ? activeText : TEXT);
         name.setFont(name.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(15f)));
-        identity.add(name);
+        nameRow.add(name);
+        if ("reach".equals(module.id())) {
+            nameRow.add(Box.createRigidArea(new Dimension(SwingTheme.scale(6), 0)));
+            nameRow.add(new WarningBadge("Unsafe"));
+        }
+        identity.add(nameRow);
         String detail = moduleSummary(module);
         JLabel details = new JLabel(detail);
-        details.setForeground(module.enabled() ? activeMutedText : MUTED_TEXT);
+        details.setForeground(colored ? activeMutedText : MUTED_TEXT);
         details.setFont(details.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
         details.setBorder(new EmptyBorder(SwingTheme.scale(4), SwingTheme.scale(0), SwingTheme.scale(0), SwingTheme.scale(0)));
         identity.add(details);
@@ -820,14 +1125,18 @@ public final class ControlPanelGui extends JFrame {
         markInteractive(toggle);
         controls.add(toggle);
         JButton expand = iconButton(expanded ? "⌃" : "⌄");
-        if (module.enabled()) expand.setForeground(activeText);
+        if (colored) expand.setForeground(activeText);
         expand.setToolTipText(expanded ? "Hide settings" : "Show settings");
         expand.addActionListener(event -> toggleExpanded(module.id()));
         controls.add(expand);
         summary.add(controls, BorderLayout.EAST);
         summary.addMouseListener(new MouseAdapter() {
-            @Override public void mouseEntered(MouseEvent event) { card.setBackgroundColor(hoverColor); }
-            @Override public void mouseExited(MouseEvent event) { card.setBackgroundColor(cardColor); }
+            @Override public void mouseEntered(MouseEvent event) {
+                if (rainbowCard != null) rainbowCard.hovered = true; else card.setBackgroundColor(hoverColor);
+            }
+            @Override public void mouseExited(MouseEvent event) {
+                if (rainbowCard != null) rainbowCard.hovered = false; else card.setBackgroundColor(cardColor);
+            }
             @Override public void mouseClicked(MouseEvent event) {
                 if (event.getSource() == summary) toggleExpanded(module.id());
             }
@@ -1175,8 +1484,16 @@ public final class ControlPanelGui extends JFrame {
         JButton button = new JButton("Key: " + KeybindCodec.displayName(module.keybind()));
         styleSmallButton(button);
         button.setPreferredSize(new Dimension(SwingTheme.scale(112), SwingTheme.scale(30)));
-        button.setToolTipText("Click, then press a keyboard key");
+        button.setToolTipText("Click, then press a key. Click again while listening to clear the bind.");
         button.addActionListener(event -> {
+            if (module.id().equals(bindingModuleId)) {
+                // A second click while listening clears the keybind — no keyboard needed.
+                bindingModuleId = null;
+                button.setText("Key: " + KeybindCodec.displayName(KeybindCodec.UNBOUND));
+                sendUpdate(module.id(), null, KeybindCodec.UNBOUND, Map.of());
+                showStatus(module.displayName() + " keybind cleared", false);
+                return;
+            }
             bindingModuleId = module.id();
             button.setText("Press a key…");
             button.requestFocusInWindow();
@@ -1191,10 +1508,8 @@ public final class ControlPanelGui extends JFrame {
                     button.setText("Key: " + KeybindCodec.displayName(module.keybind()));
                     return;
                 }
-                int keybind = event.getKeyCode() == KeyEvent.VK_BACK_SPACE || event.getKeyCode() == KeyEvent.VK_DELETE
-                        ? KeybindCodec.UNBOUND : KeybindCodec.fromKeyEvent(event);
-                if (keybind == KeybindCodec.UNBOUND
-                        && event.getKeyCode() != KeyEvent.VK_BACK_SPACE && event.getKeyCode() != KeyEvent.VK_DELETE) {
+                int keybind = KeybindCodec.fromKeyEvent(event);
+                if (keybind == KeybindCodec.UNBOUND) {
                     showStatus("That key is not supported as a Minecraft keybind.", true);
                     return;
                 }
@@ -1250,6 +1565,57 @@ public final class ControlPanelGui extends JFrame {
         });
     }
 
+    /** A sidebar category tab painted as a clean rounded pill, echoing the module cards: the
+     * selected tab fills with the accent, an unselected tab shows a soft rounded hover fill. */
+    private static final class NavButton extends JButton {
+        private final boolean selected;
+        private boolean hovered;
+
+        private NavButton(String text, boolean selected) {
+            super(text);
+            this.selected = selected;
+            setHorizontalAlignment(SwingConstants.LEFT);
+            setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+            setPreferredSize(new Dimension(SwingTheme.scale(150), SwingTheme.scale(38)));
+            setContentAreaFilled(false);
+            setBorderPainted(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setForeground(selected ? SwingTheme.contrastText(SwingTheme.ACCENT) : MUTED_TEXT);
+            setFont(getFont().deriveFont(selected ? Font.BOLD : Font.PLAIN, SwingTheme.scaleFont(13f)));
+            setBorder(new EmptyBorder(0, SwingTheme.scale(14), 0, SwingTheme.scale(12)));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent event) {
+                    hovered = true;
+                    if (!selected) setForeground(TEXT);
+                    repaint();
+                }
+                @Override public void mouseExited(MouseEvent event) {
+                    hovered = false;
+                    if (!selected) setForeground(MUTED_TEXT);
+                    repaint();
+                }
+            });
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D g2 = (Graphics2D) graphics.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int arc = SwingTheme.scale(11);
+            if (selected) {
+                g2.setColor(SwingTheme.ACCENT);
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), arc, arc);
+            } else if (hovered) {
+                g2.setColor(CARD_HOVER);
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), arc, arc);
+            }
+            g2.dispose();
+            super.paintComponent(graphics);
+        }
+    }
+
     private static JButton iconButton(String text) {
         JButton button = new JButton(text);
         button.setForeground(TEXT);
@@ -1276,11 +1642,13 @@ public final class ControlPanelGui extends JFrame {
     /** Paints the favorite icon directly so it is independent of platform font glyph support. */
     private static final class FavoriteButton extends JButton {
         private final boolean favorite;
-        private final boolean activeCard;
+        private final boolean colored;
+        private final Color activeColor;
 
-        private FavoriteButton(boolean favorite, boolean activeCard) {
+        private FavoriteButton(boolean favorite, boolean colored, Color activeColor) {
             this.favorite = favorite;
-            this.activeCard = activeCard;
+            this.colored = colored;
+            this.activeColor = activeColor;
             setContentAreaFilled(false);
             setBorderPainted(false);
             setFocusPainted(false);
@@ -1296,7 +1664,7 @@ public final class ControlPanelGui extends JFrame {
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             Path2D star = star(getWidth() / 2.0D, getHeight() / 2.0D,
                     9.0D * UiScale.factor(), 4.2D * UiScale.factor());
-            Color color = activeCard ? SwingTheme.contrastText(SwingTheme.ACCENT) : favorite ? ACCENT : MUTED_TEXT;
+            Color color = colored ? activeColor : favorite ? ACCENT : MUTED_TEXT;
             g2.setColor(color);
             if (favorite) {
                 g2.fill(star);
@@ -1462,6 +1830,130 @@ public final class ControlPanelGui extends JFrame {
         }
     }
 
+    /** Renders a player's Minecraft head avatar, fetched lazily from a public avatar service and
+     * cached, with a rounded initial-letter placeholder shown until (or if) the image loads. */
+    private static final class PlayerHead extends JComponent {
+        private final String name;
+        private final int size;
+        private final PlayerHeadCache cache;
+
+        private PlayerHead(String name, int size, PlayerHeadCache cache) {
+            this.name = name;
+            this.size = size;
+            this.cache = cache;
+            setPreferredSize(new Dimension(size, size));
+            setMinimumSize(new Dimension(size, size));
+            setMaximumSize(new Dimension(size, size));
+            setToolTipText(name);
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D g2 = (Graphics2D) graphics.create();
+            BufferedImage image = cache.cached(name);
+            if (image != null) {
+                g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                        RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+                g2.drawImage(image, 0, 0, size, size, null);
+            } else {
+                cache.request(name, this::repaint);
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(SwingTheme.lighten(CARD, 0.10D));
+                g2.fill(new RoundRectangle2D.Float(0, 0, size, size, size / 4f, size / 4f));
+                g2.setColor(MUTED_TEXT);
+                g2.setFont(getFont().deriveFont(Font.BOLD, size * 0.5f));
+                String initial = name.isBlank() ? "?" : name.substring(0, 1).toUpperCase(Locale.ROOT);
+                int textWidth = g2.getFontMetrics().stringWidth(initial);
+                int ascent = g2.getFontMetrics().getAscent();
+                int descent = g2.getFontMetrics().getDescent();
+                g2.drawString(initial, (size - textWidth) / 2f, (size + ascent - descent) / 2f);
+            }
+            g2.dispose();
+        }
+    }
+
+    /** {@link javax.swing.Icon} form of a player head, for use in autocomplete menu items. Repaints
+     * its host component once the image finishes loading. */
+    private static final class PlayerHeadIcon implements javax.swing.Icon {
+        private final String name;
+        private final int size;
+        private final PlayerHeadCache cache;
+
+        private PlayerHeadIcon(String name, int size, PlayerHeadCache cache) {
+            this.name = name;
+            this.size = size;
+            this.cache = cache;
+        }
+
+        @Override public int getIconWidth() { return size; }
+
+        @Override public int getIconHeight() { return size; }
+
+        @Override
+        public void paintIcon(Component c, Graphics graphics, int x, int y) {
+            Graphics2D g2 = (Graphics2D) graphics.create();
+            BufferedImage image = cache.cached(name);
+            if (image != null) {
+                g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                        RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+                g2.drawImage(image, x, y, size, size, null);
+            } else {
+                cache.request(name, c::repaint);
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(SwingTheme.lighten(CARD, 0.10D));
+                g2.fill(new RoundRectangle2D.Float(x, y, size, size, size / 4f, size / 4f));
+            }
+            g2.dispose();
+        }
+    }
+
+    /** Loads and caches player head images off the Swing thread. Failures (offline, blocked) are
+     * silent — the placeholder simply remains. */
+    private static final class PlayerHeadCache {
+        private final Map<String, BufferedImage> cache = new ConcurrentHashMap<>();
+        private final Set<String> pending = ConcurrentHashMap.newKeySet();
+
+        BufferedImage cached(String name) {
+            return cache.get(key(name));
+        }
+
+        void request(String name, Runnable onLoaded) {
+            String key = key(name);
+            if (cache.containsKey(key) || !pending.add(key)) {
+                return;
+            }
+            Thread.ofVirtual().name("aurora-head-" + key).start(() -> {
+                BufferedImage image = fetch(name);
+                if (image != null) {
+                    cache.put(key, image);
+                }
+                pending.remove(key);
+                if (image != null) {
+                    SwingUtilities.invokeLater(onLoaded);
+                }
+            });
+        }
+
+        private static BufferedImage fetch(String name) {
+            try {
+                URLConnection connection = URI.create(
+                        "https://minotar.net/helm/" + name + "/64.png").toURL().openConnection();
+                connection.setConnectTimeout(4000);
+                connection.setReadTimeout(4000);
+                connection.setRequestProperty("User-Agent", "Aurora");
+                try (InputStream input = connection.getInputStream()) {
+                    return ImageIO.read(input);
+                }
+            } catch (Exception exception) {
+                return null;
+            }
+        }
+
+        private static String key(String name) {
+            return name.strip().toLowerCase(Locale.ROOT);
+        }
+    }
+
     /** A font-independent help badge with an immediate explanatory tooltip. */
     static final class HelpButton extends JComponent {
         private final Color foreground;
@@ -1494,6 +1986,59 @@ public final class ControlPanelGui extends JFrame {
             int x = (getWidth() - g2.getFontMetrics().stringWidth(question)) / 2;
             int y = (getHeight() - g2.getFontMetrics().getHeight()) / 2 + g2.getFontMetrics().getAscent();
             g2.drawString(question, x, y);
+            g2.dispose();
+        }
+    }
+
+    /** Compact warning marker used for modules that carry an elevated detection risk. */
+    static final class WarningBadge extends JComponent {
+        private static final Color WARNING = new Color(0xF5C451);
+
+        WarningBadge(String warning) {
+            int size = SwingTheme.scale(17);
+            setPreferredSize(new Dimension(size, size));
+            setMinimumSize(new Dimension(size, size));
+            setMaximumSize(new Dimension(size, size));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            String text = warning == null || warning.isBlank() ? "Warning" : warning.strip();
+            setToolTipText(text);
+            getAccessibleContext().setAccessibleName(text);
+        }
+
+        @Override
+        public AccessibleContext getAccessibleContext() {
+            if (accessibleContext == null) {
+                accessibleContext = new AccessibleWarningBadge();
+            }
+            return accessibleContext;
+        }
+
+        private final class AccessibleWarningBadge extends AccessibleJComponent {
+            @Override
+            public AccessibleRole getAccessibleRole() {
+                return AccessibleRole.ICON;
+            }
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D g2 = (Graphics2D) graphics.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int inset = Math.max(1, SwingTheme.scale(1));
+            Path2D triangle = new Path2D.Float();
+            triangle.moveTo(getWidth() / 2.0D, inset);
+            triangle.lineTo(getWidth() - inset, getHeight() - inset);
+            triangle.lineTo(inset, getHeight() - inset);
+            triangle.closePath();
+            g2.setColor(WARNING);
+            g2.fill(triangle);
+            g2.setColor(new Color(0x241D0B));
+            g2.setFont(getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(10f)));
+            String mark = "!";
+            int x = (getWidth() - g2.getFontMetrics().stringWidth(mark)) / 2;
+            int y = (getHeight() - g2.getFontMetrics().getHeight()) / 2
+                    + g2.getFontMetrics().getAscent() + SwingTheme.scale(2);
+            g2.drawString(mark, x, y);
             g2.dispose();
         }
     }

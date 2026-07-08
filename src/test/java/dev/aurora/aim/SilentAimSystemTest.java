@@ -87,6 +87,30 @@ class SilentAimSystemTest {
         assertFalse(DecoupledAimState.get().isActive());
     }
 
+    @Test
+    void decoupledSmoothingContinuesFromSilentAnglesDuringVisualCameraPass() {
+        CapturingSink sink = new CapturingSink();
+        AimSmoothingProfile smoothing = new AimSmoothingProfile(
+                SmoothingMode.EaseOut, 0.58D, 64.0D, 48.0D, 0.0D, 0.0D);
+        SilentAimRequest request = SilentAimRequest.builder("decoupled", new AimAngles(90.0F, 0.0F))
+                .smoothingProfile(smoothing)
+                .decoupled(true)
+                .build();
+
+        AimAngles first = system.apply(
+                new SilentAimSystem.AimRuntime(true, new AimAngles(0.0F, 0.0F), 0.5D, sink),
+                request
+        );
+        // Camera rendering can temporarily expose the frozen visual angle as the player angle.
+        AimAngles second = system.apply(
+                new SilentAimSystem.AimRuntime(true, new AimAngles(0.0F, 0.0F), 0.5D, sink),
+                request
+        );
+
+        assertTrue(second.yaw() > first.yaw(),
+                "decoupled aim must advance from its last silent rotation, not the camera rotation");
+    }
+
     private static final class CapturingSink implements SilentAimSystem.RotationSink {
         private AimAngles last;
 

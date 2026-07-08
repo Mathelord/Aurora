@@ -62,7 +62,17 @@ public final class SilentAimSystem {
         AimAngles currentAngles = runtime.currentAngles().clampedPitch();
         boolean decoupled = request.decoupled();
         if (decoupled) {
-            DecoupledAimState.get().activate(currentAngles);
+            DecoupledAimState decoupledState = DecoupledAimState.get();
+            if (decoupledState.isActive()) {
+                // Camera rendering temporarily writes the visual rotation to the player. An aim
+                // update can run during that window, so the runtime rotation is not a reliable
+                // smoothing origin once decoupled aim is active. Continue from the last rotation
+                // we actually sent instead; otherwise render and tick updates pull against each
+                // other and make a stationary target visibly jitter.
+                currentAngles = decoupledState.silentAngles();
+            } else {
+                decoupledState.activate(currentAngles);
+            }
         } else if (DecoupledAimState.get().isActive()) {
             runtime.rotationSink().apply(DecoupledAimState.get().deactivate());
         }

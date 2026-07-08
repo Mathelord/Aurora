@@ -9,6 +9,8 @@ public record IpcMessage(Type type, String payload) {
         STATUS,
         MODULE_LIST,
         MODULE_UPDATE,
+        GLOBAL_SETTINGS,
+        FRIENDS,
         EVENT_SAMPLE,
         LOG,
         DETACH

@@ -12,6 +12,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -81,6 +82,22 @@ public final class AgentConnectionHub implements AutoCloseable {
         return true;
     }
 
+    public boolean sendGlobalSettings(boolean silentAimCrosshairIndicator) {
+        AgentConnection active = connection.get();
+        if (active == null) return false;
+        active.send(new IpcMessage(IpcMessage.Type.GLOBAL_SETTINGS,
+                Json.object(Map.of("silentAimCrosshairIndicator", silentAimCrosshairIndicator))));
+        return true;
+    }
+
+    /** Pushes the friends list to the agent so combat modules and ESP can honor it. */
+    public boolean sendFriends(List<String> friends) {
+        AgentConnection active = connection.get();
+        if (active == null) return false;
+        active.send(new IpcMessage(IpcMessage.Type.FRIENDS, Json.array(friends)));
+        return true;
+    }
+
     private void acceptLoop() {
         while (!serverSocket.isClosed()) {
             try {
@@ -108,6 +125,10 @@ public final class AgentConnectionHub implements AutoCloseable {
             Optional.ofNullable(connection.getAndSet(agentConnection)).ifPresent(AgentConnection::close);
             statusJson = Json.object(Map.of("attached", true, "message", "Agent connected", "hello", hello.payload()));
             logs.add("INFO", "Agent connected");
+            agentConnection.send(new IpcMessage(IpcMessage.Type.GLOBAL_SETTINGS,
+                    Json.object(Map.of("silentAimCrosshairIndicator", GuiPreferences.silentAimCrosshairIndicator()))));
+            agentConnection.send(new IpcMessage(IpcMessage.Type.FRIENDS,
+                    Json.array(GuiPreferences.friends())));
 
             String line;
             while ((line = reader.readLine()) != null && agentConnection.open) {
@@ -131,7 +152,7 @@ public final class AgentConnectionHub implements AutoCloseable {
             case EVENT_SAMPLE -> eventSampleJson = message.payload();
             case LOG -> logs.add(Json.stringField(message.payload(), "level") == null ? "INFO" : Json.stringField(message.payload(), "level"),
                     Json.stringField(message.payload(), "message") == null ? message.payload() : Json.stringField(message.payload(), "message"));
-            case HELLO, MODULE_UPDATE, DETACH -> {
+            case HELLO, MODULE_UPDATE, GLOBAL_SETTINGS, FRIENDS, DETACH -> {
             }
         }
     }

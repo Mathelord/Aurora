@@ -21,7 +21,7 @@ class PacketRelayTest {
     @Test
     void inboundPacketsPassThroughWithNoActiveRequest() {
         assertFalse(relay.isLagging());
-        assertFalse(relay.shouldSuppress(true, new FakeConnection(), new FakePacket()));
+        assertFalse(relay.captureInbound(new FakeListener(), new FakePacket()));
     }
 
     @Test
@@ -29,13 +29,26 @@ class PacketRelayTest {
         relay.request("owner-a", 50, 5000);
         assertTrue(relay.isLagging());
 
-        FakeConnection connection = new FakeConnection();
+        FakeListener listener = new FakeListener();
         FakePacket packet = new FakePacket();
-        assertTrue(relay.shouldSuppress(true, connection, packet));
+        assertTrue(relay.captureInbound(listener, packet));
 
         relay.release("owner-a");
         assertFalse(relay.isLagging());
-        assertFalse(relay.shouldSuppress(true, connection, new FakePacket()));
+        assertFalse(relay.captureInbound(listener, new FakePacket()));
+    }
+
+    @Test
+    void protocolCriticalRequestsBypassInboundDelay() {
+        relay.request("owner-a", 5000, 5000);
+        FakeListener listener = new FakeListener();
+
+        assertFalse(relay.captureInbound(listener, new net.minecraft.class_2670()));
+        assertFalse(relay.captureInbound(listener, new net.minecraft.class_6373()));
+        assertEquals(0, relay.heldInboundCount());
+
+        assertTrue(relay.captureInbound(listener, new FakePacket()));
+        assertEquals(1, relay.heldInboundCount());
     }
 
     @Test
@@ -61,39 +74,39 @@ class PacketRelayTest {
     }
 
     @Test
-    void heldInboundPacketsAreReplayedThroughTheConnectionListenerOnceReleased() {
+    void heldInboundPacketsAreReplayedThroughTheCapturedListenerOnceReleased() {
         relay.request("owner-a", 5000, 5000);
-        FakeConnection connection = new FakeConnection();
+        FakeListener listener = new FakeListener();
         FakePacket packet = new FakePacket();
-        assertTrue(relay.shouldSuppress(true, connection, packet));
+        assertTrue(relay.captureInbound(listener, packet));
 
         // Releasing drops the effective latency to zero, which makes onTick() force-release
         // everything still queued regardless of each packet's own release time.
         relay.release("owner-a");
         relay.onTick();
 
-        assertEquals(List.of(packet), connection.listener.applied);
-    }
-
-    @Test
-    void intermediaryPacketListenerAccessorWinsOverTheNettyChannelField() {
-        relay.request("owner-a", 5000, 5000);
-        IntermediaryConnection connection = new IntermediaryConnection();
-        FakePacket packet = new FakePacket();
-        assertTrue(relay.shouldSuppress(true, connection, packet));
-
-        relay.release("owner-a");
-        relay.onTick();
-
-        assertEquals(List.of(packet), connection.field_11652.applied);
+        assertEquals(List.of(packet), listener.applied);
     }
 
     @Test
     void replaysThroughMinecraft1214IntermediaryPacketApplyMethod() {
         relay.request("owner-a", 5000, 5000);
-        IntermediaryConnection connection = new IntermediaryConnection();
+        FakeListener listener = new FakeListener();
         IntermediaryPacket packet = new IntermediaryPacket();
-        assertTrue(relay.shouldSuppress(true, connection, packet));
+        assertTrue(relay.captureInbound(listener, packet));
+
+        relay.release("owner-a");
+        relay.onTick();
+
+        assertEquals(1, packet.applied);
+    }
+
+    @Test
+    void replaysThroughOfficialObfuscated1214Names() {
+        relay.request("owner-a", 5000, 5000);
+        FakeListener listener = new FakeListener();
+        OfficialPacket packet = new OfficialPacket();
+        assertTrue(relay.captureInbound(listener, packet));
 
         relay.release("owner-a");
         relay.onTick();
@@ -107,7 +120,7 @@ class PacketRelayTest {
         net.minecraft.class_2684 movement = new net.minecraft.class_2684.class_2685(
                 7, (short) 4096, (short) -2048, (short) 1024);
 
-        assertTrue(relay.shouldSuppress(true, new FakeConnection(), movement));
+        assertTrue(relay.captureInbound(new FakeListener(), movement));
 
         assertEquals(1.0D, relay.heldDisplacement(7).x(), 1.0e-9);
         assertEquals(-0.5D, relay.heldDisplacement(7).y(), 1.0e-9);
@@ -121,8 +134,8 @@ class PacketRelayTest {
         FakePacket first = new FakePacket();
         FakePacket second = new FakePacket();
 
-        assertTrue(relay.shouldSuppress(false, connection, first));
-        assertTrue(relay.shouldSuppress(false, connection, second));
+        assertTrue(relay.captureOutbound(connection, first));
+        assertTrue(relay.captureOutbound(connection, second));
         assertEquals(2, relay.heldOutboundCount());
 
         relay.flushOutbound();
@@ -133,27 +146,29 @@ class PacketRelayTest {
 
     @Test
     void outboundPacketsPassThroughWhenNotHeld() {
-        assertFalse(relay.shouldSuppress(false, new FakeConnection(), new FakePacket()));
+        assertFalse(relay.captureOutbound(new FakeConnection(), new FakePacket()));
+    }
+
+    @Test
+    void protocolTransitionFlushesOldPacketsAndPassesThroughVanilla() {
+        relay.holdOutbound();
+        FakeConnection connection = new FakeConnection();
+        FakePacket queued = new FakePacket();
+        assertTrue(relay.captureOutbound(connection, queued));
+
+        assertFalse(relay.captureOutbound(connection, new TransitionPacket()));
+
+        assertEquals(List.of(queued), connection.sent);
+        assertEquals(0, relay.heldOutboundCount());
+        assertFalse(relay.captureOutbound(connection, new FakePacket()));
     }
 
     private static final class FakeConnection {
-        private final FakeListener listener = new FakeListener();
         private final List<FakePacket> sent = new ArrayList<>();
 
         @SuppressWarnings("unused")
         void send(FakePacket packet) {
             sent.add(packet);
-        }
-    }
-
-    private static final class IntermediaryConnection {
-        @SuppressWarnings("unused")
-        private final Object field_11651 = new Object();
-        private final FakeListener field_11652 = new FakeListener();
-
-        @SuppressWarnings("unused")
-        private FakeListener method_10744() {
-            return field_11652;
         }
     }
 
@@ -174,6 +189,22 @@ class PacketRelayTest {
         @SuppressWarnings("unused")
         private void method_65081(FakeListener listener) {
             applied++;
+        }
+    }
+
+    private static final class OfficialPacket {
+        private int applied;
+
+        @SuppressWarnings("unused")
+        private void a(FakeListener listener) {
+            applied++;
+        }
+    }
+
+    private static final class TransitionPacket {
+        @SuppressWarnings("unused")
+        private boolean method_55943() {
+            return true;
         }
     }
 }

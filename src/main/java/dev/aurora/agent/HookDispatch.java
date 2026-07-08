@@ -36,15 +36,15 @@ public final class HookDispatch {
                 controller.onWorldRender(arguments[0], arguments[1]));
         // Packet callbacks return true to suppress the original send/receive call (the packet is
         // being held by PacketRelay for later replay); false lets it proceed normally.
-        System.getProperties().put(INBOUND_PACKET_CALLBACK_KEY, (BiPredicate<Object, Object>) (connection, packet) ->
-                controller.onPacket(PacketEvent.Direction.INBOUND, connection, packet));
+        System.getProperties().put(INBOUND_PACKET_CALLBACK_KEY, (BiPredicate<Object, Object>) (listener, packet) ->
+                controller.onPacket(PacketEvent.Direction.INBOUND, listener, packet));
         System.getProperties().put(OUTBOUND_PACKET_CALLBACK_KEY, (BiPredicate<Object, Object>) (connection, packet) ->
                 controller.onPacket(PacketEvent.Direction.OUTBOUND, connection, packet));
         System.getProperties().put(LOOK_CALLBACK_KEY, (Predicate<Object[]>) arguments -> controller.onLook(
                 arguments[0], ((Number) arguments[1]).doubleValue(), ((Number) arguments[2]).doubleValue()));
         System.getProperties().put(CAMERA_BEGIN_CALLBACK_KEY, (Predicate<Object>) controller::onCameraBegin);
         System.getProperties().put(CAMERA_END_CALLBACK_KEY, (Consumer<Object[]>) arguments ->
-                controller.onCameraEnd(arguments[0], arguments[1]));
+                controller.onCameraEnd(arguments[0], arguments[1], ((Number) arguments[2]).doubleValue()));
         System.getProperties().put(SCROLL_CALLBACK_KEY, (Consumer<Double>) controller::onMouseScroll);
         System.getProperties().put(MOVEMENT_CALLBACK_KEY, (Consumer<Object>) controller::onMovementInput);
         System.getProperties().put(ATTACK_SUPPRESSION_CALLBACK_KEY,

@@ -45,6 +45,21 @@ class ReflectionWorldGeometryTest {
         assertEquals(1, providers.flushes);
     }
 
+    @Test
+    void drawsWithMinecraft12111RenderLayersAndRawVertexMethods() {
+        FakeMatrices matrices = new FakeMatrices();
+        ModernProviders providers = new ModernProviders();
+        CameraPose camera = new CameraPose(true, new Vec3(10, 20, 30), 0.0F, 0.0F, 70.0, 1920, 1080);
+        WorldGeometryBatch.Line line = new WorldGeometryBatch.Line(
+                new Vec3(11, 22, 33), new Vec3(14, 26, 38), 0xFF112233, 0xFF445566);
+
+        assertTrue(ReflectionWorldGeometry.draw(matrices, providers, camera, List.of(), List.of(line)));
+
+        assertEquals(List.of(new Vec3(1, 2, 3), new Vec3(4, 6, 8)), providers.consumer.vertices);
+        assertEquals(2, providers.consumer.normals);
+        assertEquals(1, providers.flushes);
+    }
+
     public static final class FakeMatrices {
         private final FakeEntry entry = new FakeEntry();
 
@@ -86,6 +101,38 @@ class ReflectionWorldGeometryTest {
         }
 
         public FakeConsumer method_60831(FakeEntry ignored, float x, float y, float z) {
+            return this;
+        }
+    }
+
+    public static final class ModernProviders {
+        private final ModernConsumer consumer = new ModernConsumer();
+        private int flushes;
+
+        public ModernConsumer method_73477(class_1921 ignored) {
+            return consumer;
+        }
+
+        public void method_22994(class_1921 ignored) {
+            flushes++;
+        }
+    }
+
+    public static final class ModernConsumer {
+        private final List<Vec3> vertices = new ArrayList<>();
+        private int normals;
+
+        public ModernConsumer method_22912(float x, float y, float z) {
+            vertices.add(new Vec3(x, y, z));
+            return this;
+        }
+
+        public ModernConsumer method_1336(int red, int green, int blue, int alpha) {
+            return this;
+        }
+
+        public ModernConsumer method_22914(float x, float y, float z) {
+            normals++;
             return this;
         }
     }

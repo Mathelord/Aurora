@@ -8,6 +8,10 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.stream.Collectors;
 
 public final class ProcessDiscovery {
@@ -18,7 +22,9 @@ public final class ProcessDiscovery {
             String displayName = descriptor.displayName();
             String commandLine = commandLine(pid).orElse(displayName);
             List<String> hints = minecraftHints(displayName + " " + commandLine);
-            processes.add(new JavaProcess(pid, displayName, commandLine, !hints.isEmpty(), hints));
+            Optional<String> minecraftVersion = MinecraftVersionDetector.detect(displayName, commandLine);
+            processes.add(new JavaProcess(
+                    pid, displayName, commandLine, !hints.isEmpty(), hints, minecraftVersion));
         }
         return processes.stream()
                 .sorted(Comparator.comparing(JavaProcess::likelyMinecraft).reversed()
@@ -45,10 +51,29 @@ public final class ProcessDiscovery {
     }
 
     private Optional<String> commandLine(String pid) {
+        Optional<String> procCommandLine = procCommandLine(pid);
+        if (procCommandLine.isPresent()) {
+            return procCommandLine;
+        }
         try {
             return ProcessHandle.of(Long.parseLong(pid))
                     .flatMap(handle -> handle.info().commandLine());
         } catch (NumberFormatException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private static Optional<String> procCommandLine(String pid) {
+        try {
+            byte[] bytes = Files.readAllBytes(Path.of("/proc", pid, "cmdline"));
+            if (bytes.length == 0) {
+                return Optional.empty();
+            }
+            String commandLine = new String(bytes, StandardCharsets.UTF_8)
+                    .replace('\0', ' ')
+                    .trim();
+            return commandLine.isEmpty() ? Optional.empty() : Optional.of(commandLine);
+        } catch (IOException | SecurityException ignored) {
             return Optional.empty();
         }
     }

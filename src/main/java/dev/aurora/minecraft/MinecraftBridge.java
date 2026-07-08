@@ -9,12 +9,33 @@ import java.util.OptionalInt;
 public interface MinecraftBridge {
     boolean isSinglePlayer();
 
+    /** Whether a local player and client world are currently loaded. */
+    default boolean isInGame() {
+        return false;
+    }
+
     boolean applyReach(double range);
 
     boolean resetReach();
 
     default AimContext aimContext(double range, boolean ignoreWalls) {
         return AimContext.unavailable();
+    }
+
+    /** Names of every player currently known to the client (server tab list plus any players loaded
+     * in the world), for friend-name autocomplete in the control panel. */
+    default List<String> onlinePlayerNames() {
+        return List.of();
+    }
+
+    /**
+     * Nearby players that are friended, within {@code range} blocks. These are deliberately excluded
+     * from {@link #aimContext} (so combat modules never act on a friend) but ESP still needs them to
+     * paint friend boxes, so it queries them separately here. Implementations register the returned
+     * targets for {@link #targetPose} lookups the same way {@link #aimContext} does.
+     */
+    default List<AimTarget> friendTargets(double range) {
+        return List.of();
     }
 
     default boolean applyAimRotation(double yaw, double pitch) {
@@ -54,6 +75,45 @@ public interface MinecraftBridge {
     }
 
     default boolean applyEntityRotation(Object entity, float yaw, float pitch) {
+        return false;
+    }
+
+    /** Like {@link #applyEntityRotation}, but also sets the previous-tick rotation so the camera's
+     * interpolated look angle (and its third-person offset direction) lands exactly on {@code
+     * yaw}/{@code pitch}. Used by Free Look / Freecam while overriding the camera in every
+     * perspective. */
+    default boolean applyCameraEntityRotation(Object entity, float yaw, float pitch) {
+        return applyEntityRotation(entity, yaw, pitch);
+    }
+
+    /** Overrides the render camera's world-space position, used by Freecam to detach the view from
+     * the player. Returns whether the write succeeded. */
+    default boolean applyCameraPosition(Object camera, double x, double y, double z) {
+        return false;
+    }
+
+    /** Forces the camera's "detached" (third-person) flag so, while Freecam holds the view away from
+     * the player in first-person mode, the game still renders the player body and hides the held-item
+     * hand. Returns whether the write succeeded. */
+    default boolean setCameraDetached(Object camera, boolean detached) {
+        return false;
+    }
+
+    /** Ordinal of the current camera perspective (0 = first person, 1 = third-person back, 2 =
+     * third-person front), or -1 if unavailable. Used by Free Look / Freecam to save and restore the
+     * player's view mode. */
+    default int cameraPerspective() {
+        return -1;
+    }
+
+    /** Switches the camera perspective by ordinal (see {@link #cameraPerspective()}). */
+    default boolean setCameraPerspective(int ordinal) {
+        return false;
+    }
+
+    /** Zeroes a player movement input (forward/strafe/jump/sneak/sprint) so the body stays put while
+     * Freecam flies the camera. Returns whether the input was actually cleared. */
+    default boolean freezeMovementInput(Object input) {
         return false;
     }
 
@@ -101,7 +161,27 @@ public interface MinecraftBridge {
         return Optional.empty();
     }
 
+    /** Returns whether another player within {@code range} is holding {@code item} in either hand. */
+    default boolean isNearbyPlayerHolding(ItemType item, double range) {
+        return false;
+    }
+
     default int findHotbarItem(ItemType item) {
+        return -1;
+    }
+
+    /** Total count of an item in the nine hotbar slots. */
+    default int hotbarItemCount(ItemType item) {
+        return findHotbarItem(item) >= 0 ? 1 : 0;
+    }
+
+    /** Respawn-anchor charge count at a block position, or -1 when the block is not an anchor. */
+    default int respawnAnchorCharges(int x, int y, int z) {
+        return -1;
+    }
+
+    /** First sword in the hotbar, or -1 when none is present. */
+    default int findHotbarSword() {
         return -1;
     }
 
@@ -172,6 +252,35 @@ public interface MinecraftBridge {
         return false;
     }
 
+    /** Draws a compact rounded HUD surface using the bridge's rectangle primitive. */
+    default boolean fillRounded(Object renderContext, int left, int top, int right, int bottom,
+                                int radius, int color) {
+        int width = right - left;
+        int height = bottom - top;
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+        int corner = Math.max(0, Math.min(radius, Math.min(width, height) / 2));
+        if (corner == 0) {
+            return fill(renderContext, left, top, right, bottom, color);
+        }
+
+        boolean rendered = fill(renderContext, left + corner, top, right - corner, bottom, color);
+        rendered |= fill(renderContext, left + 1, top + 1, right - 1, bottom - 1, color);
+        rendered |= fill(renderContext, left, top + corner, right, bottom - corner, color);
+        return rendered;
+    }
+
+    /** Scaled dimensions used by HUD drawing, or {@link HudSize#unavailable()} when unknown. */
+    default HudSize hudSize(Object renderContext) {
+        return HudSize.unavailable();
+    }
+
+    default boolean drawHudLine(Object renderContext, double startX, double startY,
+                                double endX, double endY, int color) {
+        return false;
+    }
+
     default boolean drawText(Object renderContext, String text, int x, int y, int color) {
         return false;
     }
@@ -189,6 +298,11 @@ public interface MinecraftBridge {
      */
     default Optional<AimTarget> crosshairEntity(double range) {
         return Optional.empty();
+    }
+
+    /** Like {@link #crosshairEntity(double)}, but only returns player entities. */
+    default Optional<AimTarget> crosshairPlayer(double range) {
+        return crosshairEntity(range);
     }
 
     default boolean isOnGround() {
@@ -239,6 +353,11 @@ public interface MinecraftBridge {
         return Vec3.ZERO;
     }
 
+    /** Current local-player eye position used for world-space aim calculations. */
+    default Vec3 playerEyePosition() {
+        return playerPosition().add(0.0D, 1.62D, 0.0D);
+    }
+
     /**
      * Resolves the current render-space pose (feet position and dimensions) of a target previously
      * reported by {@link #aimContext} or {@link #crosshairEntity}, matched by {@link AimTarget#id()}.
@@ -274,6 +393,11 @@ public interface MinecraftBridge {
      * Fullbright value can be applied. Returns whether the write succeeded. */
     default boolean setGamma(double value) {
         return false;
+    }
+
+    /** Restores a valid vanilla gamma value through the option's normal setter when available. */
+    default boolean restoreGamma(double value) {
+        return setGamma(value);
     }
 
     /** The client's remaining item-use (right-click) cooldown in ticks, or -1 if unavailable. */

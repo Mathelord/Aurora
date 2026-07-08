@@ -15,7 +15,12 @@ final class ReflectionWorldGeometry {
     private static volatile Consumer<String> diagnosticSink = message -> System.err.println("[Aurora] " + message);
     private static volatile String lastError = "";
     private static final List<String> RENDER_LAYER_CLASSES = List.of(
-            "net.minecraft.client.render.RenderLayer", "net.minecraft.class_1921", "gmj"
+            "net.minecraft.client.renderer.RenderType",
+            "net.minecraft.client.renderer.rendertype.RenderType",
+            "net.minecraft.client.render.RenderLayer", "net.minecraft.class_1921", "gmj", "ijs"
+    );
+    private static final List<String> RENDER_LAYERS_CLASSES = List.of(
+            "net.minecraft.client.render.RenderLayers", "net.minecraft.class_12249", "ijt"
     );
     private static final List<String> RENDER_PHASE_CLASSES = List.of(
             "net.minecraft.client.render.RenderPhase", "net.minecraft.class_4668"
@@ -58,11 +63,12 @@ final class ReflectionWorldGeometry {
             Object entry = invokeNoArgs(matrices, List.of("peek", "method_23760", "c"));
             ClassLoader loader = matrices.getClass().getClassLoader();
             Class<?> renderLayerClass = loadAny(loader, RENDER_LAYER_CLASSES);
-            Method getBuffer = method(providers.getClass(), List.of("getBuffer", "method_24145"), 1,
+            Method getBuffer = method(providers.getClass(), List.of("getBuffer", "method_24145", "method_73477"), 1,
                     candidate -> candidate.getParameterTypes()[0].isAssignableFrom(renderLayerClass));
 
             if (!quads.isEmpty()) {
-                Object fillLayer = invokeStaticNoArgs(renderLayerClass,
+                Object fillLayer = renderLayer(loader, renderLayerClass,
+                        List.of("debugQuads", "method_76023", "w"),
                         List.of("getDebugQuads", "method_49042", "C"));
                 Object consumer = getBuffer.invoke(providers, fillLayer);
                 VertexMethods vertices = VertexMethods.forConsumer(consumer, entry);
@@ -75,7 +81,9 @@ final class ReflectionWorldGeometry {
             }
 
             if (!lines.isEmpty()) {
-                Object lineLayer = invokeStaticNoArgs(renderLayerClass, List.of("getLines", "method_23594", "y"));
+                Object lineLayer = renderLayer(loader, renderLayerClass,
+                        List.of("lines", "method_76015", "r"),
+                        List.of("getLines", "method_23594", "y"));
                 Object consumer = getBuffer.invoke(providers, lineLayer);
                 VertexMethods vertices = VertexMethods.forConsumer(consumer, entry);
                 for (WorldGeometryBatch.Line line : lines) {
@@ -108,8 +116,10 @@ final class ReflectionWorldGeometry {
             Class<?> renderLayerClass = loadAny(loader, RENDER_LAYER_CLASSES);
             Object noDepthLayer = noDepthQuadLayer(loader);
             Object layer = noDepthLayer != null ? noDepthLayer
-                    : invokeStaticNoArgs(renderLayerClass, List.of("getDebugQuads", "method_49042", "C"));
-            Method getBuffer = method(providers.getClass(), List.of("getBuffer", "method_24145"), 1,
+                    : renderLayer(loader, renderLayerClass,
+                    List.of("debugQuads", "method_76023", "w"),
+                    List.of("getDebugQuads", "method_49042", "C"));
+            Method getBuffer = method(providers.getClass(), List.of("getBuffer", "method_24145", "method_73477"), 1,
                     candidate -> candidate.getParameterTypes()[0].isInstance(layer));
             Object consumer = getBuffer.invoke(providers, layer);
             VertexMethods vertices = VertexMethods.forConsumer(consumer, entry);
@@ -230,6 +240,17 @@ final class ReflectionWorldGeometry {
         return method.invoke(null);
     }
 
+    /** Resolves the 1.21.11 RenderLayers factories first, then the factories that lived directly on
+     * RenderLayer through 1.21.10. Fabric production uses the intermediary names in each list. */
+    private static Object renderLayer(ClassLoader loader, Class<?> legacyOwner, List<String> modernNames,
+                                      List<String> legacyNames) throws ReflectiveOperationException {
+        try {
+            return invokeStaticNoArgs(loadAny(loader, RENDER_LAYERS_CLASSES), modernNames);
+        } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+            return invokeStaticNoArgs(legacyOwner, legacyNames);
+        }
+    }
+
     private static Object invokeNoArgs(Object target, List<String> names) throws ReflectiveOperationException {
         Method method = method(target.getClass(), names, 0,
                 candidate -> !Modifier.isStatic(candidate.getModifiers()) && candidate.getReturnType() != boolean.class);
@@ -255,22 +276,48 @@ final class ReflectionWorldGeometry {
         throw new NoSuchMethodException(type.getName() + "." + names);
     }
 
-    private record VertexMethods(Method vertex, Method color, Method normal) {
+    private record VertexMethods(Method vertex, boolean vertexUsesEntry, Method color,
+                                 Method normal, boolean normalUsesEntry) {
         static VertexMethods forConsumer(Object consumer, Object entry) throws NoSuchMethodException {
             Class<?> type = consumer.getClass();
-            Method vertex = method(type, List.of("vertex", "method_56824", "a"), 4, candidate -> {
-                Class<?>[] p = candidate.getParameterTypes();
-                return p[0].isInstance(entry) && p[1] == float.class && p[2] == float.class && p[3] == float.class;
-            });
+            Method vertex;
+            boolean vertexUsesEntry;
+            try {
+                vertex = method(type, List.of("vertex", "method_56824", "a"), 4, candidate -> {
+                    Class<?>[] p = candidate.getParameterTypes();
+                    return p[0].isInstance(entry) && p[1] == float.class
+                            && p[2] == float.class && p[3] == float.class;
+                });
+                vertexUsesEntry = true;
+            } catch (NoSuchMethodException ignored) {
+                vertex = method(type, List.of("vertex", "method_22912", "a"), 3,
+                        candidate -> allFloats(candidate.getParameterTypes()));
+                vertexUsesEntry = false;
+            }
             Method color = method(type, List.of("color", "method_1336", "a"), 4, candidate -> {
                 Class<?>[] p = candidate.getParameterTypes();
                 return p[0] == int.class && p[1] == int.class && p[2] == int.class && p[3] == int.class;
             });
-            Method normal = method(type, List.of("normal", "method_60831", "b"), 4, candidate -> {
-                Class<?>[] p = candidate.getParameterTypes();
-                return p[0].isInstance(entry) && p[1] == float.class && p[2] == float.class && p[3] == float.class;
-            });
-            return new VertexMethods(vertex, color, normal);
+            Method normal;
+            boolean normalUsesEntry;
+            try {
+                normal = method(type, List.of("normal", "method_60831", "b"), 4, candidate -> {
+                    Class<?>[] p = candidate.getParameterTypes();
+                    return p[0].isInstance(entry) && p[1] == float.class
+                            && p[2] == float.class && p[3] == float.class;
+                });
+                normalUsesEntry = true;
+            } catch (NoSuchMethodException ignored) {
+                normal = method(type, List.of("normal", "method_22914", "b"), 3,
+                        candidate -> allFloats(candidate.getParameterTypes()));
+                normalUsesEntry = false;
+            }
+            return new VertexMethods(vertex, vertexUsesEntry, color, normal, normalUsesEntry);
+        }
+
+        private static boolean allFloats(Class<?>[] parameters) {
+            return parameters.length == 3 && parameters[0] == float.class
+                    && parameters[1] == float.class && parameters[2] == float.class;
         }
 
         void quad(Object entry, Object consumer, Vec3 a, Vec3 b, Vec3 c, Vec3 d,
@@ -291,10 +338,20 @@ final class ReflectionWorldGeometry {
 
         private void vertex(Object entry, Object consumer, Vec3 point, int argb, Vec3 direction)
                 throws ReflectiveOperationException {
-            vertex.invoke(consumer, entry, (float) point.x(), (float) point.y(), (float) point.z());
+            if (vertexUsesEntry) {
+                vertex.invoke(consumer, entry, (float) point.x(), (float) point.y(), (float) point.z());
+            } else {
+                vertex.invoke(consumer, (float) point.x(), (float) point.y(), (float) point.z());
+            }
             color.invoke(consumer, (argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF, (argb >>> 24) & 0xFF);
             if (direction != null) {
-                normal.invoke(consumer, entry, (float) direction.x(), (float) direction.y(), (float) direction.z());
+                if (normalUsesEntry) {
+                    normal.invoke(consumer, entry, (float) direction.x(), (float) direction.y(),
+                            (float) direction.z());
+                } else {
+                    normal.invoke(consumer, (float) direction.x(), (float) direction.y(),
+                            (float) direction.z());
+                }
             }
         }
     }

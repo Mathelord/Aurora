@@ -65,7 +65,7 @@ public final class AimAssistModule extends AbstractModule {
                 .description("Angular field of view around your crosshair in which targets can be acquired.");
         this.ignoreWalls = booleanSetting("ignore-walls", "Ignore Walls", true)
                 .description("Allows Aim Assist to select players even when blocks obstruct the line of sight.");
-        this.priority = optionSetting("priority", "Priority", TargetPriority.PreferAge.ordinal(), optionNames(TargetPriority.values()))
+        this.priority = optionSetting("priority", "Priority", TargetPriority.ClosestAngle.ordinal(), optionNames(TargetPriority.values()))
                 .description("Controls how Aim Assist chooses between multiple valid targets.");
         this.holdMouse = booleanSetting("hold-mouse", "Hold Left Mouse", false)
                 .description("Requires the physical left mouse button to be held before Aim Assist tracks a target.");

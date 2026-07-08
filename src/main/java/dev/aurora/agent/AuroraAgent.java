@@ -40,9 +40,10 @@ public final class AuroraAgent {
         if (!connected) {
             System.err.println("[Aurora] Running without injector IPC. Use the localhost UI or provide agent args to control modules.");
         }
-        RuntimeController controller = RuntimeController.install(instrumentation, ipc);
+        RuntimeController controller = RuntimeController.install(instrumentation, ipc, arguments.minecraftVersion());
         CONTROLLER.set(controller);
-        ipc.log("INFO", "Aurora agent installed");
+        ipc.log("INFO", "Aurora agent installed for Minecraft "
+                + (arguments.minecraftVersion().isBlank() ? "auto/unknown" : arguments.minecraftVersion()));
         ipc.send(IpcMessage.Type.STATUS, "{\"attached\":true,\"message\":\"Aurora agent installed\"}");
     }
 

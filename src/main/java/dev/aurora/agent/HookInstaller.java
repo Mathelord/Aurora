@@ -86,17 +86,28 @@ public final class HookInstaller {
     private static final List<String> BLOCK_ATTACK_METHODS = List.of(
             "handleBlockBreaking", "continueAttack", "method_1581", "method_1590"
     );
-    private final HookProfile profile = HookProfile.minecraft1214();
+    private static final List<String> PACKET_INTERFACE_TYPES = List.of(
+            "net.minecraft.network.packet.Packet", "net.minecraft.class_2596", "yw", "aay"
+    );
+    private static final List<String> PACKET_LISTENER_TYPES = List.of(
+            "net.minecraft.network.listener.PacketListener", "net.minecraft.class_2547", "vv", "xk"
+    );
+    private final HookProfile profile;
     private final Consumer<String> diagnosticSink;
     private final AtomicBoolean installed = new AtomicBoolean();
     private Instrumentation instrumentation;
     private ResettableClassFileTransformer byteBuddyTransformer;
 
     public HookInstaller() {
-        this(message -> System.err.println("[Aurora] " + message));
+        this(HookProfile.minecraft1214(), message -> System.err.println("[Aurora] " + message));
     }
 
     public HookInstaller(Consumer<String> diagnosticSink) {
+        this(HookProfile.minecraft1214(), diagnosticSink);
+    }
+
+    public HookInstaller(HookProfile profile, Consumer<String> diagnosticSink) {
+        this.profile = profile == null ? HookProfile.minecraft1214() : profile;
         this.diagnosticSink = diagnosticSink == null ? ignored -> { } : diagnosticSink;
     }
 
@@ -118,6 +129,10 @@ public final class HookInstaller {
         }
         byteBuddyTransformer = null;
         instrumentation = null;
+    }
+
+    boolean supportsWorldRendering() {
+        return profile.hasWorldRenderHook();
     }
 
     private ResettableClassFileTransformer installByteBuddyHooks(Instrumentation instrumentation) {
@@ -142,9 +157,10 @@ public final class HookInstaller {
                                                             ProtectionDomain protectionDomain) {
                         return builder
                                 .visit(Advice.to(TickAdvice.class).on(namedMethodAny(profile.tickMethods())))
-                                .visit(Advice.to(AttackSuppressionAdvice.class).on(namedMethodAny(ATTACK_METHODS)))
+                                .visit(Advice.to(AttackSuppressionAdvice.class).on(
+                                        namedMethodAny(profile.attackMethods()).and(ElementMatchers.takesArguments(0))))
                                 .visit(Advice.to(BlockAttackSuppressionAdvice.class).on(
-                                        namedMethodAny(BLOCK_ATTACK_METHODS)));
+                                        namedMethodAny(profile.blockAttackMethods()).and(ElementMatchers.takesArguments(1))));
                     }
                 })
                 .type(namedTypeAny(profile.renderClasses()))
@@ -153,10 +169,11 @@ public final class HookInstaller {
                     public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
                                                             ClassLoader classLoader, JavaModule module,
                                                             ProtectionDomain protectionDomain) {
-                        return builder.visit(Advice.to(RenderAdvice.class).on(namedMethodAny(profile.renderMethods())));
+                        return builder.visit(Advice.to(RenderAdvice.class).on(
+                                namedMethodAny(profile.renderMethods()).and(ElementMatchers.takesArguments(2))));
                     }
                 })
-                .type(namedTypeAny(WORLD_RENDER_CLASSES))
+                .type(namedTypeAny(profile.worldRenderClasses()))
                 .transform(new AgentBuilder.Transformer() {
                     @Override
                     public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
@@ -165,33 +182,38 @@ public final class HookInstaller {
                         return builder.visit(Advice.to(WorldRenderAdvice.class).on(worldRenderMethod()));
                     }
                 })
-                .type(namedTypeAny(MOUSE_CLASSES))
+                .type(namedTypeAny(profile.mouseClasses()))
                 .transform(new AgentBuilder.Transformer() {
                     @Override
                     public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
                                                             ClassLoader classLoader, JavaModule module,
                                                             ProtectionDomain protectionDomain) {
                         return builder
-                                .visit(Advice.to(MouseButtonAdvice.class).on(namedMethodAny(MOUSE_BUTTON_METHODS)))
-                                .visit(Advice.to(MouseScrollAdvice.class).on(namedMethodAny(MOUSE_SCROLL_METHODS)));
+                                .visit(Advice.to(MouseButtonAdvice.class).on(
+                                        namedMethodAny(profile.mouseButtonMethods()).and(
+                                                ElementMatchers.takesArguments(profile.mouseButtonArgumentCount()))))
+                                .visit(Advice.to(MouseScrollAdvice.class).on(
+                                        namedMethodAny(profile.mouseScrollMethods()).and(ElementMatchers.takesArguments(3))));
                     }
                 })
-                .type(namedTypeAny(ENTITY_CLASSES))
+                .type(namedTypeAny(profile.entityClasses()))
                 .transform(new AgentBuilder.Transformer() {
                     @Override
                     public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
                                                             ClassLoader classLoader, JavaModule module,
                                                             ProtectionDomain protectionDomain) {
-                        return builder.visit(Advice.to(LookAdvice.class).on(namedMethodAny(LOOK_METHODS)));
+                        return builder.visit(Advice.to(LookAdvice.class).on(
+                                namedMethodAny(profile.lookMethods()).and(ElementMatchers.takesArguments(2))));
                     }
                 })
-                .type(namedTypeAny(CAMERA_CLASSES))
+                .type(namedTypeAny(profile.cameraClasses()))
                 .transform(new AgentBuilder.Transformer() {
                     @Override
                     public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
                                                             ClassLoader classLoader, JavaModule module,
                                                             ProtectionDomain protectionDomain) {
-                        return builder.visit(Advice.to(CameraAdvice.class).on(namedMethodAny(CAMERA_UPDATE_METHODS)));
+                        return builder.visit(Advice.to(CameraAdvice.class).on(
+                                namedMethodAny(profile.cameraUpdateMethods()).and(ElementMatchers.takesArguments(5))));
                     }
                 })
                 .type(namedTypeAny(KEYBOARD_INPUT_CLASSES))
@@ -236,11 +258,11 @@ public final class HookInstaller {
         return profile.tickClasses().contains(className)
                 || profile.renderClasses().contains(className)
                 || profile.packetClasses().contains(className)
-                || MOUSE_CLASSES.contains(className)
-                || ENTITY_CLASSES.contains(className)
-                || CAMERA_CLASSES.contains(className)
+                || profile.mouseClasses().contains(className)
+                || profile.entityClasses().contains(className)
+                || profile.cameraClasses().contains(className)
                 || KEYBOARD_INPUT_CLASSES.contains(className)
-                || WORLD_RENDER_CLASSES.contains(className);
+                || profile.worldRenderClasses().contains(className);
     }
 
     private static ElementMatcher.Junction<? super TypeDescription> namedTypeAny(List<String> names) {
@@ -259,29 +281,29 @@ public final class HookInstaller {
         return matcher;
     }
 
-    static ElementMatcher.Junction<? super MethodDescription> worldRenderMethod() {
-        // The official 1.21.4 name is the heavily overloaded "a". Restricting the matcher to the
-        // five-argument renderEntities signature prevents advice from being installed on unrelated
-        // WorldRenderer methods.
-        return namedMethodAny(WORLD_RENDER_METHODS).and(ElementMatchers.takesArguments(5));
+    ElementMatcher.Junction<? super MethodDescription> worldRenderMethod() {
+        // Official jars overload the obfuscated name "a" heavily. The argument count separates
+        // renderEntities (1.21.4-1.21.8) from renderBlockDestroyAnimation (1.21.9-1.21.11).
+        return namedMethodAny(profile.worldRenderMethods())
+                .and(ElementMatchers.takesArguments(profile.worldRenderArgumentCount()));
     }
 
-    static ElementMatcher.Junction<? super MethodDescription> outboundPacketMethod() {
-        return ElementMatchers.<MethodDescription>named("method_10743")
-                .or(ElementMatchers.<MethodDescription>named("send").and(ElementMatchers.takesArguments(1)));
+    ElementMatcher.Junction<? super MethodDescription> outboundPacketMethod() {
+        return namedMethodAny(profile.outboundPacketMethods())
+                .and(ElementMatchers.takesArguments(1))
+                .and(ElementMatchers.takesArgument(0, namedTypeAny(PACKET_INTERFACE_TYPES)));
     }
 
-    static ElementMatcher.Junction<? super MethodDescription> inboundPacketMethod() {
-        // The inbound handler is ClientConnection#channelRead0(ChannelHandlerContext, Packet). It keeps
-        // that name even in intermediary-mapped production because it overrides Netty's
-        // SimpleChannelInboundHandler and Netty is not remapped. Do NOT match method_10770: that is the
-        // *static* handlePacket(Packet, PacketListener), which has no `this` for @Advice.This (aborting
-        // the whole ClientConnection transform) and hands the listener, not the packet, as the last arg.
-        // Ignore the erased compiler bridge channelRead0(ctx, Object), otherwise every inbound packet is
-        // dispatched once by the bridge and once by the typed implementation.
-        return ElementMatchers.<MethodDescription>named("channelRead0")
+    ElementMatcher.Junction<? super MethodDescription> inboundPacketMethod() {
+        // Hook the final static dispatch boundary, after ClientConnection selected and validated the
+        // listener but before Packet#apply(listener). Exact parameter types disambiguate the heavily
+        // overloaded official name `a`. This boundary is handlePacket in Yarn and method_10759 in
+        // Fabric intermediary for both supported versions.
+        return namedMethodAny(profile.inboundPacketMethods())
                 .and(ElementMatchers.takesArguments(2))
-                .and(ElementMatchers.not(ElementMatchers.takesArgument(1, Object.class)));
+                .and(ElementMatchers.isStatic())
+                .and(ElementMatchers.takesArgument(0, namedTypeAny(PACKET_INTERFACE_TYPES)))
+                .and(ElementMatchers.takesArgument(1, namedTypeAny(PACKET_LISTENER_TYPES)));
     }
 
     public static final class TickAdvice {
@@ -390,6 +412,7 @@ public final class HookInstaller {
         @Advice.OnMethodExit(suppress = Throwable.class)
         public static void onExit(@Advice.This Object camera,
                                   @Advice.Argument(1) Object focusedEntity,
+                                  @Advice.Argument(4) float tickDelta,
                                   @Advice.Enter boolean altered) {
             if (!altered) {
                 return;
@@ -398,7 +421,7 @@ public final class HookInstaller {
             if (callback instanceof Consumer<?> consumer) {
                 @SuppressWarnings("unchecked")
                 Consumer<Object[]> cameraEnd = (Consumer<Object[]>) consumer;
-                cameraEnd.accept(new Object[]{camera, focusedEntity});
+                cameraEnd.accept(new Object[]{camera, focusedEntity, tickDelta});
             }
         }
     }
@@ -422,38 +445,30 @@ public final class HookInstaller {
      */
     public static final class OutboundPacketAdvice {
         @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
-        public static boolean onEnter(@Advice.This Object connection, @Advice.AllArguments Object[] arguments) {
-            return dispatch(HookDispatch.OUTBOUND_PACKET_CALLBACK_KEY, connection, firstArgument(arguments));
+        public static boolean onEnter(@Advice.This Object connection, @Advice.Argument(0) Object packet) {
+            Object callback = System.getProperties().get("dev.aurora.hook.packet.outbound");
+            if (!(callback instanceof BiPredicate<?, ?> predicate)) {
+                return false;
+            }
+            @SuppressWarnings("unchecked")
+            BiPredicate<Object, Object> typed = (BiPredicate<Object, Object>) predicate;
+            return typed.test(connection, packet);
         }
     }
 
-    /**
-     * Inbound packet hook (the connection's {@code channelRead0}/{@code handlePacket}-family
-     * methods, shaped {@code (ChannelHandlerContext, Packet)} or similar). The packet is always the
-     * last reference-typed argument.
-     */
+    /** Inbound hook at {@code handlePacket(Packet, PacketListener)}. */
     public static final class InboundPacketAdvice {
         @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
-        public static boolean onEnter(@Advice.This Object connection, @Advice.AllArguments Object[] arguments) {
-            return dispatch(HookDispatch.INBOUND_PACKET_CALLBACK_KEY, connection, lastArgument(arguments));
+        public static boolean onEnter(@Advice.Argument(0) Object packet,
+                                      @Advice.Argument(1) Object listener) {
+            Object callback = System.getProperties().get("dev.aurora.hook.packet.inbound");
+            if (!(callback instanceof BiPredicate<?, ?> predicate)) {
+                return false;
+            }
+            @SuppressWarnings("unchecked")
+            BiPredicate<Object, Object> typed = (BiPredicate<Object, Object>) predicate;
+            return typed.test(listener, packet);
         }
     }
 
-    private static boolean dispatch(String callbackKey, Object connection, Object packet) {
-        Object callback = System.getProperties().get(callbackKey);
-        if (!(callback instanceof BiPredicate<?, ?> predicate)) {
-            return false;
-        }
-        @SuppressWarnings("unchecked")
-        BiPredicate<Object, Object> typed = (BiPredicate<Object, Object>) predicate;
-        return typed.test(connection, packet);
-    }
-
-    private static Object firstArgument(Object[] arguments) {
-        return arguments == null || arguments.length == 0 ? null : arguments[0];
-    }
-
-    private static Object lastArgument(Object[] arguments) {
-        return arguments == null || arguments.length == 0 ? null : arguments[arguments.length - 1];
-    }
 }

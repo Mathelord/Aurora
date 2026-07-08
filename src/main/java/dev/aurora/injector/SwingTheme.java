@@ -84,7 +84,7 @@ final class SwingTheme {
         return value <= 0.04045D ? value / 12.92D : Math.pow((value + 0.055D) / 1.055D, 2.4D);
     }
 
-    private static Color lighten(Color color, double amount) {
+    static Color lighten(Color color, double amount) {
         return new Color(
                 color.getRed() + (int) Math.round((255 - color.getRed()) * amount),
                 color.getGreen() + (int) Math.round((255 - color.getGreen()) * amount),

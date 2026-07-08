@@ -1,6 +1,8 @@
 package dev.aurora.modules;
 
 import dev.aurora.aim.AimAngles;
+import dev.aurora.aim.AimPointDrift;
+import dev.aurora.aim.AimMath;
 import dev.aurora.aim.AimSmoothingProfile;
 import dev.aurora.aim.DecoupledAimState;
 import dev.aurora.aim.SilentAimRequest;
@@ -18,6 +20,7 @@ import dev.aurora.minecraft.CombatState;
 import dev.aurora.minecraft.AimContext;
 import dev.aurora.minecraft.AimTarget;
 import dev.aurora.minecraft.MinecraftBridge;
+import dev.aurora.minecraft.TargetPose;
 
 import java.util.Arrays;
 import java.util.Comparator;
@@ -52,6 +55,8 @@ public final class SilentAuraModule extends AbstractModule {
     private final ModuleSetting strafeAimBoost;
     private final CritSprintReset critSprintReset;
     private final CriticalHitDetector criticalHitDetector = new CriticalHitDetector();
+    private final AimPointDrift chinDrift = new AimPointDrift(0.10D, 0.07D, 0.16D, 600L, 1_700L);
+    private final AimPointDrift microDrift = new AimPointDrift(0.025D, 0.018D, 0.24D, 150L, 350L);
 
     private CrystalComboController crystalComboController;
     private String targetId;
@@ -150,7 +155,7 @@ public final class SilentAuraModule extends AbstractModule {
         AimTarget target = acquireTarget(context);
         if (target == null) {
             clearAim();
-            if (allowAttack) {
+            if (allowAttack && !(enabled(pauseOnUse) && minecraft.isUsingItem())) {
                 maybeMissSwing();
             }
             return;
@@ -160,8 +165,29 @@ public final class SilentAuraModule extends AbstractModule {
             currentRange = rollRange();
         }
         targetId = target.id();
+        // Eclipse advances its rotation state from the render loop only. Keeping the tick path out
+        // of the smoother is important: otherwise tick and render callbacks feed two unrelated
+        // clocks into acceleration, random speed modulation, mouse quantization, and aim drift.
+        if (!allowAttack) {
+            applyAim(context, target);
+        }
+
+        if (allowAttack) {
+            if (enabled(pauseOnUse) && minecraft.isUsingItem()) {
+                clearPendingAttack();
+            } else if (minecraft.crosshairEntity(0.0D).isEmpty()) {
+                clearPendingAttack();
+                maybeMissSwing();
+            } else {
+                attackWhenReady(target);
+            }
+        }
+    }
+
+    private void applyAim(AimContext context, AimTarget target) {
         AimAngles currentAngles = new AimAngles((float) context.yaw(), (float) context.pitch());
-        AimAngles targetAngles = new AimAngles((float) target.yaw(), (float) target.pitch());
+        dev.aurora.aim.Vec3 aimPoint = movingAimPoint(target);
+        AimAngles targetAngles = anglesTo(minecraft.playerEyePosition(), aimPoint);
         StrafeAimAssist.Result strafe = enabled(strafeAimIncrease)
                 ? StrafeAimAssist.plan(minecraft.playerVelocity(), currentAngles, targetAngles,
                 strafeAimBoost.value(), TARGET_RESPONSE, STRAFE_TARGET_RESPONSE)
@@ -175,7 +201,7 @@ public final class SilentAuraModule extends AbstractModule {
                 ),
                 SilentAimRequest.builder(AIM_OWNER, targetAngles)
                         .priority(100)
-                        .targetPoint(target.targetPoint())
+                        .targetPoint(aimPoint)
                         .smoothingProfile(smoothingProfile())
                         .targetResponse(strafe.targetResponse())
                         .rotationMultiplier(strength.value() * strafe.rotationMultiplier())
@@ -183,10 +209,6 @@ public final class SilentAuraModule extends AbstractModule {
                         .globalDecoupledAllowed(false)
                         .build()
         );
-
-        if (allowAttack) {
-            attackWhenReady(target);
-        }
     }
 
     private AimTarget acquireTarget(AimContext context) {
@@ -303,15 +325,36 @@ public final class SilentAuraModule extends AbstractModule {
             return;
         }
         missRolled = true;
-        AimContext nearby = minecraft.aimContext(currentRange + 2.0D, enabled(ignoreWalls));
+        // Eclipse considers any valid nearby player, including one hidden behind a wall. Visibility
+        // controls aiming, not whether an otherwise plausible miss can be rolled.
+        AimContext nearby = minecraft.aimContext(currentRange + 2.0D, true);
         if (nearby.available() && !nearby.targets().isEmpty()
-                && ThreadLocalRandom.current().nextDouble(100.0D) < missChance.value()) {
-            minecraft.swingMainHand();
+                && ThreadLocalRandom.current().nextInt(100) < (int) Math.round(missChance.value())) {
+            RealClickSimulator.leftClick();
         }
     }
 
     private AimSmoothingProfile smoothingProfile() {
         return new AimSmoothingProfile(SmoothingMode.Humanized, speed.value(), 74.0D, 58.0D, 0.0D, 0.0D);
+    }
+
+    private dev.aurora.aim.Vec3 movingAimPoint(AimTarget target) {
+        TargetPose pose = minecraft.targetPose(target.id()).orElse(null);
+        double width = pose == null ? 0.6D : pose.width();
+        double height = pose == null ? 1.8D : pose.height();
+        dev.aurora.aim.Vec3 eye = minecraft.playerEyePosition();
+        dev.aurora.aim.Vec3 point = chinDrift.apply(target.id(), target.targetPoint(), eye, width, height);
+        return microDrift.apply(target.id(), point, eye, width, height);
+    }
+
+    private static AimAngles anglesTo(dev.aurora.aim.Vec3 from, dev.aurora.aim.Vec3 to) {
+        double deltaX = to.x() - from.x();
+        double deltaY = to.y() - from.y();
+        double deltaZ = to.z() - from.z();
+        double horizontal = Math.hypot(deltaX, deltaZ);
+        float yaw = (float) (Math.toDegrees(Math.atan2(deltaZ, deltaX)) - 90.0D);
+        float pitch = (float) -Math.toDegrees(Math.atan2(deltaY, horizontal));
+        return new AimAngles((float) AimMath.wrapDegrees(yaw), pitch);
     }
 
     private boolean canAttackWithCritTiming(CriticalHitDetector.Detection critical) {
@@ -354,6 +397,8 @@ public final class SilentAuraModule extends AbstractModule {
 
     private void clearAim() {
         targetId = null;
+        chinDrift.reset();
+        microDrift.reset();
         clearPendingAttack();
         SilentAimSystem.get().clearOwner(AIM_OWNER);
     }
@@ -364,6 +409,8 @@ public final class SilentAuraModule extends AbstractModule {
         criticalHitDetector.reset();
         perfectTiming = rollPerfectTiming();
         currentRange = rollRange();
+        chinDrift.reset();
+        microDrift.reset();
         clearPendingAttack();
     }
 

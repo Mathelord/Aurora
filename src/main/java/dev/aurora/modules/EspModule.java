@@ -22,6 +22,7 @@ public final class EspModule extends AbstractModule {
     private final Supplier<String> trajectoryHitEntityId;
     private final ModuleSetting range;
     private final ModuleSetting color;
+    private final ModuleSetting friendColor;
 
     public EspModule(MinecraftBridge minecraft) {
         this(minecraft, () -> null);
@@ -35,6 +36,8 @@ public final class EspModule extends AbstractModule {
                 .description("Maximum distance at which to render player boxes.");
         this.color = colorSetting("color", "Color", 0xFF6464)
                 .description("Color of the ESP box.");
+        this.friendColor = colorSetting("friend-color", "Friend Color", 0x64C8FF)
+                .description("Color of the ESP box drawn around friended players.");
     }
 
     @Override
@@ -44,13 +47,21 @@ public final class EspModule extends AbstractModule {
             return;
         }
 
-        int boxColor = colorArgb();
+        int boxColor = colorArgb(color);
         // Defer to Trajectories for the entity its arc currently marks, so that entity gets a single
         // box (in the trajectory color) instead of two overlapping ones.
         String deferredId = trajectoryHitEntityId.get();
         for (AimTarget target : context.targets()) {
             if (target != null && !target.id().equals(deferredId)) {
                 renderPlayerBox(event.geometry(), target, boxColor);
+            }
+        }
+        // Friends are excluded from the aim context, so they never appear above; render them
+        // separately in the friend color.
+        int friendBoxColor = colorArgb(friendColor);
+        for (AimTarget friend : minecraft.friendTargets(range.value())) {
+            if (friend != null && !friend.id().equals(deferredId)) {
+                renderPlayerBox(event.geometry(), friend, friendBoxColor);
             }
         }
     }
@@ -67,8 +78,8 @@ public final class EspModule extends AbstractModule {
         geometry.espBox(min, max, withAlpha(boxColor, FILL_ALPHA), withAlpha(boxColor, BORDER_ALPHA));
     }
 
-    private int colorArgb() {
-        return 0xFF000000 | ((int) Math.round(color.value()) & 0x00FFFFFF);
+    private static int colorArgb(ModuleSetting setting) {
+        return 0xFF000000 | ((int) Math.round(setting.value()) & 0x00FFFFFF);
     }
 
     private static int withAlpha(int colorRgb, int alpha) {

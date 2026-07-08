@@ -57,6 +57,14 @@ class KnockbackPacketsTest {
         assertFalse(packets.isOwnKnockback(new FabricExplosionPacket(Optional.empty()), 42));
     }
 
+    @Test
+    void recognizesOfficial12111ExplosionKnockback() {
+        KnockbackPackets packets = new KnockbackPackets(Set.of(), Set.of(OfficialExplosionPacket.class.getName()));
+
+        assertTrue(packets.isOwnKnockback(new OfficialExplosionPacket(Optional.of("knockback")), 42));
+        assertFalse(packets.isOwnKnockback(new OfficialExplosionPacket(Optional.empty()), 42));
+    }
+
     private static final class FakeVelocityPacket {
         private final int entityId;
 
@@ -99,6 +107,13 @@ class KnockbackPacketsTest {
     private record FabricExplosionPacket(Optional<?> knockback) {
         @SuppressWarnings("unused")
         public Optional<?> comp_2884() {
+            return knockback;
+        }
+    }
+
+    private record OfficialExplosionPacket(Optional<?> knockback) {
+        @SuppressWarnings("unused")
+        public Optional<?> e() {
             return knockback;
         }
     }
