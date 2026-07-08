@@ -304,6 +304,7 @@ public final class ControlPanelGui extends JFrame {
         button.addActionListener(event -> {
             selectedCategory = category;
             pageTitle.setText(category);
+            resetListScroll();
             boolean dedicated = SETTINGS.equals(category) || FRIENDS.equals(category);
             searchField.setEnabled(!dedicated);
             footerHelpLabel.setText(SETTINGS.equals(category)
@@ -471,6 +472,7 @@ public final class ControlPanelGui extends JFrame {
     }
 
     private void rebuildSettingsPage() {
+        int scrollY = currentListScrollY();
         listPanel.setVisible(false);
         listPanel.removeAll();
         listPanel.add(appearanceCard());
@@ -480,7 +482,7 @@ public final class ControlPanelGui extends JFrame {
         listPanel.add(targetRingSettingsCard());
         listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
         listPanel.add(scaleCard());
-        finishDedicatedPageRebuild(SETTINGS, "Appearance, aim, ring & scale");
+        finishDedicatedPageRebuild(SETTINGS, "Appearance, aim, ring & scale", scrollY);
     }
 
     private JComponent targetRingSettingsCard() {
@@ -560,15 +562,15 @@ public final class ControlPanelGui extends JFrame {
         getContentPane().repaint();
     }
 
-    private void finishDedicatedPageRebuild(String title, String count) {
+    private void finishDedicatedPageRebuild(String title, String count, int scrollY) {
         pageTitle.setText(title);
         resultCount.setText(count);
         listPanel.setVisible(true);
         listPanel.revalidate();
         if (listScroll != null) {
-            listScroll.getViewport().setViewPosition(new Point(0, 0));
             listScroll.getViewport().revalidate();
             listScroll.getViewport().repaint();
+            SwingUtilities.invokeLater(() -> restoreListScrollY(scrollY));
         }
         // Repaint the full content subtree. Linux Swing can otherwise retain pixels from the
         // previous module page when an opaque card list is replaced by custom non-opaque cards.
@@ -723,10 +725,27 @@ public final class ControlPanelGui extends JFrame {
     }
 
     private void rebuildFriendsPage() {
+        int scrollY = currentListScrollY();
         listPanel.setVisible(false);
         listPanel.removeAll();
         listPanel.add(friendsCard());
-        finishDedicatedPageRebuild(FRIENDS, friends.size() + (friends.size() == 1 ? " friend" : " friends"));
+        finishDedicatedPageRebuild(FRIENDS,
+                friends.size() + (friends.size() == 1 ? " friend" : " friends"), scrollY);
+    }
+
+    private int currentListScrollY() {
+        return listScroll == null ? 0 : listScroll.getViewport().getViewPosition().y;
+    }
+
+    private void resetListScroll() {
+        restoreListScrollY(0);
+    }
+
+    private void restoreListScrollY(int requestedY) {
+        if (listScroll == null) return;
+        int maximumY = Math.max(0,
+                listPanel.getPreferredSize().height - listScroll.getViewport().getExtentSize().height);
+        listScroll.getViewport().setViewPosition(new Point(0, Math.min(Math.max(0, requestedY), maximumY)));
     }
 
     private JComponent friendsCard() {
