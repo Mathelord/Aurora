@@ -38,6 +38,26 @@ public interface MinecraftBridge {
         return List.of();
     }
 
+    /** Nearby renderable entities for the Nametags HUD. */
+    default List<NametagTarget> nametagTargets(double range) {
+        return List.of();
+    }
+
+    default void captureWorldProjection(Object matrixStack) {
+    }
+
+    /**
+     * Starts a 3D render frame. Implementations may use this boundary to share interpolated entity
+     * poses between world-render modules without carrying those poses into the next frame.
+     */
+    default void beginWorldFrame() {
+    }
+
+    default ScreenPosition projectToScreen(Object renderContext, Vec3 worldPosition) {
+        return ScreenPosition.invisible();
+    }
+
+
     default boolean applyAimRotation(double yaw, double pitch) {
         return false;
     }
@@ -69,6 +89,7 @@ public interface MinecraftBridge {
     default boolean isLocalPlayer(Object entity) {
         return false;
     }
+
 
     default boolean applyCameraRotation(Object camera, float yaw, float pitch) {
         return false;
@@ -151,6 +172,11 @@ public interface MinecraftBridge {
 
     default BlockType blockType(int x, int y, int z) {
         return BlockType.OTHER;
+    }
+
+    /** Whether vanilla block placement may replace the block currently occupying this position. */
+    default boolean isBlockReplaceableAt(int x, int y, int z) {
+        return blockType(x, y, z) == BlockType.AIR;
     }
 
     default boolean hasEntityCollision(Vec3 min, Vec3 max) {
@@ -271,6 +297,20 @@ public interface MinecraftBridge {
         return rendered;
     }
 
+    /**
+     * Draws a rounded glass surface backed by a real blur of the current game framebuffer.
+     * Implementations return {@code false} when GPU effects are unavailable so callers can fall
+     * back to {@link #fillRounded(Object, int, int, int, int, int, int)}.
+     */
+    default boolean drawFrostedPanel(Object renderContext, int left, int top, int right, int bottom,
+                                     int radius, float blurRadius, int tintColor, int borderColor) {
+        return false;
+    }
+
+    /** Marks the start of a HUD render pass so expensive effects can share one scene capture. */
+    default void beginHudFrame(Object renderContext) {
+    }
+
     /** Scaled dimensions used by HUD drawing, or {@link HudSize#unavailable()} when unknown. */
     default HudSize hudSize(Object renderContext) {
         return HudSize.unavailable();
@@ -285,11 +325,42 @@ public interface MinecraftBridge {
         return false;
     }
 
+    default boolean drawScaledText(Object renderContext, String text, int x, int y, double scale, int color) {
+        return drawText(renderContext, text, x, y, color);
+    }
+
+    /**
+     * Draws several colored runs under one scale transform. {@link TextRun#xOffset()} is expressed
+     * in unscaled font pixels, relative to {@code x}. Implementations with matrix access should
+     * override this method so a tag needs only one matrix push/translate/scale/pop sequence.
+     */
+    default boolean drawScaledTextBatch(Object renderContext, List<TextRun> runs,
+                                        double x, double y, double scale) {
+        if (runs == null || runs.isEmpty() || !Double.isFinite(scale) || scale <= 0.0D) {
+            return false;
+        }
+        boolean rendered = true;
+        for (TextRun run : runs) {
+            if (run == null || run.text() == null || run.text().isEmpty()) {
+                continue;
+            }
+            rendered &= drawScaledText(renderContext, run.text(),
+                    (int) Math.round(x + run.xOffset() * scale), (int) Math.round(y),
+                    scale, run.color());
+        }
+        return rendered;
+    }
+
+    /** One colored string within a scaled HUD text batch. */
+    record TextRun(String text, int xOffset, int color) {
+    }
+
     /** Width in pixels {@code text} would render at, using the game's current font. Needed to
      * center/truncate text in the click GUI; returns an estimate (0) if unavailable. */
     default int textWidth(String text) {
         return 0;
     }
+
 
     /**
      * Resolves whatever entity the player's real (unmodified) crosshair is currently on — unlike
@@ -328,6 +399,9 @@ public interface MinecraftBridge {
     default boolean setForwardKeyHeld(boolean held) {
         return false;
     }
+    default boolean setBackwardKeyHeld(boolean held) { return false; }
+    default boolean setLeftKeyHeld(boolean held) { return false; }
+    default boolean setRightKeyHeld(boolean held) { return false; }
 
     default boolean isForwardKeyPhysicallyDown() {
         return false;

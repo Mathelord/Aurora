@@ -1,5 +1,7 @@
 package dev.aurora.agent;
 
+import dev.aurora.versions.v1_21_11.Version12111Hooks;
+
 import java.util.List;
 import java.util.Map;
 
@@ -40,6 +42,9 @@ public record HookProfile(
 
     public static HookProfile forVersion(String requestedVersion) {
         String version = requestedVersion == null ? "" : requestedVersion.trim();
+        if ("1.21.11".equals(version)) {
+            return Version12111Hooks.profile();
+        }
         ObfuscatedNames obfuscated = OBFUSCATED.get(version);
         if (obfuscated != null) {
             return obfuscatedProfile(version, obfuscated);

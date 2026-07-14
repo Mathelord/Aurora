@@ -11,8 +11,10 @@ import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JColorChooser;
+import javax.swing.JCheckBoxMenuItem;
 import javax.swing.JComponent;
 import javax.swing.JFrame;
+import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JMenuItem;
@@ -59,6 +61,7 @@ import java.awt.image.BufferedImage;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URLConnection;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -93,9 +96,11 @@ public final class ControlPanelGui extends JFrame {
     private static final String ALL = "All modules";
     private static final String SETTINGS = "Settings";
     private static final String FRIENDS = "Friends";
+    private static final String PROFILES = "Profiles";
     private static final String TARGET_RING_MODULE_ID = "target-ring";
 
     private final AgentConnectionHub agentHub;
+    private final ProfileStore profiles = new ProfileStore();
     private final Preferences preferences = Preferences.userNodeForPackage(ControlPanelGui.class);
     private final Set<String> favorites = new LinkedHashSet<>();
     private final Set<String> friends = new LinkedHashSet<>();
@@ -221,6 +226,8 @@ public final class ControlPanelGui extends JFrame {
         hint.setBorder(new EmptyBorder(SwingTheme.scale(8), SwingTheme.scale(0), SwingTheme.scale(0), SwingTheme.scale(0)));
         bottomNavigationPanel.add(navigationButton("☺  " + FRIENDS, FRIENDS));
         bottomNavigationPanel.add(Box.createVerticalStrut(SwingTheme.scale(5)));
+        bottomNavigationPanel.add(navigationButton("❐  " + PROFILES, PROFILES));
+        bottomNavigationPanel.add(Box.createVerticalStrut(SwingTheme.scale(5)));
         bottomNavigationPanel.add(navigationButton("⚙  " + SETTINGS, SETTINGS));
         bottomNavigationPanel.add(hint);
         sidebar.add(bottomNavigationPanel, BorderLayout.SOUTH);
@@ -292,6 +299,8 @@ public final class ControlPanelGui extends JFrame {
         bottomNavigationPanel.removeAll();
         bottomNavigationPanel.add(navigationButton("☺  " + FRIENDS, FRIENDS));
         bottomNavigationPanel.add(Box.createVerticalStrut(SwingTheme.scale(5)));
+        bottomNavigationPanel.add(navigationButton("❐  " + PROFILES, PROFILES));
+        bottomNavigationPanel.add(Box.createVerticalStrut(SwingTheme.scale(5)));
         bottomNavigationPanel.add(navigationButton("⚙  " + SETTINGS, SETTINGS));
         bottomNavigationPanel.add(hint);
         bottomNavigationPanel.revalidate();
@@ -305,12 +314,15 @@ public final class ControlPanelGui extends JFrame {
             selectedCategory = category;
             pageTitle.setText(category);
             resetListScroll();
-            boolean dedicated = SETTINGS.equals(category) || FRIENDS.equals(category);
+            boolean dedicated = SETTINGS.equals(category) || FRIENDS.equals(category)
+                    || PROFILES.equals(category);
             searchField.setEnabled(!dedicated);
             footerHelpLabel.setText(SETTINGS.equals(category)
                     ? "Appearance changes are saved automatically"
                     : FRIENDS.equals(category)
                     ? "Friends are ignored by combat modules and shown in the ESP friend color"
+                    : PROFILES.equals(category)
+                    ? "Applying a profile pushes it live to the connected client"
                     : "Enter applies values  ·  Backspace/Delete clears a keybind");
             rebuildNavigation();
             rebuildModuleList();
@@ -405,6 +417,10 @@ public final class ControlPanelGui extends JFrame {
             rebuildFriendsPage();
             return;
         }
+        if (PROFILES.equals(selectedCategory)) {
+            rebuildProfilesPage();
+            return;
+        }
         String query = searchField.getText().strip().toLowerCase(Locale.ROOT);
         List<ModuleView> visible = modules.stream()
                 .filter(module -> !TARGET_RING_MODULE_ID.equals(module.id()))
@@ -477,12 +493,117 @@ public final class ControlPanelGui extends JFrame {
         listPanel.removeAll();
         listPanel.add(appearanceCard());
         listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
+        listPanel.add(notificationSettingsCard());
+        listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
         listPanel.add(silentAimCard());
         listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
         listPanel.add(targetRingSettingsCard());
         listPanel.add(Box.createVerticalStrut(SwingTheme.scale(12)));
         listPanel.add(scaleCard());
-        finishDedicatedPageRebuild(SETTINGS, "Appearance, aim, ring & scale", scrollY);
+        finishDedicatedPageRebuild(SETTINGS, "Appearance, notifications, aim, ring & scale", scrollY);
+    }
+
+    private JComponent notificationSettingsCard() {
+        SwingTheme.RoundedPanel card = new SwingTheme.RoundedPanel(16, CARD);
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setBorder(new EmptyBorder(SwingTheme.scale(22), SwingTheme.scale(24),
+                SwingTheme.scale(22), SwingTheme.scale(24)));
+        card.setAlignmentX(0f);
+
+        JLabel title = new JLabel("Module notifications");
+        title.setForeground(TEXT);
+        title.setFont(title.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(16f)));
+        title.setAlignmentX(0f);
+        card.add(title);
+
+        JLabel description = new JLabel("Controls the compact frosted toast shown when a module changes state.");
+        description.setForeground(MUTED_TEXT);
+        description.setFont(description.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
+        description.setBorder(new EmptyBorder(SwingTheme.scale(5), 0, SwingTheme.scale(14), 0));
+        description.setAlignmentX(0f);
+        card.add(description);
+
+        JPanel enabledRow = new JPanel(new BorderLayout(SwingTheme.scale(14), 0));
+        enabledRow.setOpaque(false);
+        enabledRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+        enabledRow.setAlignmentX(0f);
+        JLabel enabledLabel = new JLabel("Show notifications");
+        enabledLabel.setForeground(TEXT);
+        enabledLabel.setFont(enabledLabel.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(12.5f)));
+        enabledLabel.setPreferredSize(new Dimension(SwingTheme.scale(150), SwingTheme.scale(34)));
+        enabledRow.add(enabledLabel, BorderLayout.WEST);
+        SwingTheme.ToggleSwitch enabledToggle = new SwingTheme.ToggleSwitch(GuiPreferences.notificationsEnabled());
+        enabledToggle.onChange(enabled -> {
+            GuiPreferences.setNotificationsEnabled(enabled);
+            agentHub.sendGlobalSettings();
+            showStatus("Module notifications " + (enabled ? "enabled" : "disabled"), false);
+            SwingUtilities.invokeLater(this::rebuildSettingsPage);
+        });
+        markInteractive(enabledToggle);
+        JPanel toggleHolder = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, SwingTheme.scale(7)));
+        toggleHolder.setOpaque(false);
+        toggleHolder.add(enabledToggle);
+        enabledRow.add(toggleHolder, BorderLayout.CENTER);
+        card.add(enabledRow);
+        if (GuiPreferences.notificationsEnabled()) {
+            card.add(Box.createVerticalStrut(SwingTheme.scale(6)));
+            card.add(notificationSliderRow("Corner radius", 8, 28, GuiPreferences.notificationRadius(), " px",
+                    value -> GuiPreferences.setNotificationRadius(value)));
+            card.add(Box.createVerticalStrut(SwingTheme.scale(6)));
+            card.add(notificationSliderRow("Blur strength", 4, 40, GuiPreferences.notificationBlur(), " px",
+                    value -> GuiPreferences.setNotificationBlur(value)));
+            card.add(Box.createVerticalStrut(SwingTheme.scale(6)));
+            card.add(notificationSliderRow("Glass opacity", 0, 100, GuiPreferences.notificationOpacity(), " %",
+                    value -> GuiPreferences.setNotificationOpacity(value)));
+            card.add(Box.createVerticalStrut(SwingTheme.scale(6)));
+            card.add(notificationSliderRow("Display duration", 5, 50,
+                    GuiPreferences.notificationDurationMillis() / 100, "00 ms",
+                    value -> GuiPreferences.setNotificationDurationMillis(value * 100)));
+        }
+
+        int contentHeight = card.getPreferredSize().height;
+        card.setPreferredSize(new Dimension(SwingTheme.scale(10), contentHeight));
+        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
+        return card;
+    }
+
+    private JComponent notificationSliderRow(String name, int minimum, int maximum, int current,
+                                             String suffix, java.util.function.IntConsumer save) {
+        JPanel row = new JPanel(new BorderLayout(SwingTheme.scale(14), 0));
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+        row.setAlignmentX(0f);
+        JLabel label = new JLabel(name);
+        label.setForeground(TEXT);
+        label.setFont(label.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(12.5f)));
+        label.setPreferredSize(new Dimension(SwingTheme.scale(150), SwingTheme.scale(34)));
+        row.add(label, BorderLayout.WEST);
+
+        JSlider slider = new SwingTheme.BallSlider(minimum, maximum, current);
+        slider.setOpaque(false);
+        slider.setFocusable(false);
+        markInteractive(slider);
+        JLabel valueLabel = new JLabel(current + suffix);
+        valueLabel.setForeground(MUTED_TEXT);
+        valueLabel.setFont(valueLabel.getFont().deriveFont(SwingTheme.scaleFont(12f)));
+        valueLabel.setPreferredSize(new Dimension(SwingTheme.scale(64), SwingTheme.scale(30)));
+        slider.setToolTipText(current + suffix);
+        slider.addChangeListener(event -> {
+            int value = slider.getValue();
+            valueLabel.setText(value + suffix);
+            slider.setToolTipText(value + suffix);
+            if (!slider.getValueIsAdjusting()) {
+                save.accept(value);
+                agentHub.sendGlobalSettings();
+                showStatus(name + " set to " + value + suffix, false);
+            }
+        });
+        JPanel editor = new JPanel(new BorderLayout(SwingTheme.scale(10), 0));
+        editor.setOpaque(false);
+        editor.add(slider, BorderLayout.CENTER);
+        editor.add(valueLabel, BorderLayout.EAST);
+        row.add(editor, BorderLayout.CENTER);
+        return row;
     }
 
     private JComponent targetRingSettingsCard() {
@@ -545,6 +666,7 @@ public final class ControlPanelGui extends JFrame {
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
         return card;
     }
+
 
     /** Rebuilds the whole window from scratch so a changed {@link UiScale} factor takes effect right
      * away instead of only after the panel is reopened: every panel recomputes its sizes and fonts
@@ -731,6 +853,286 @@ public final class ControlPanelGui extends JFrame {
         listPanel.add(friendsCard());
         finishDedicatedPageRebuild(FRIENDS,
                 friends.size() + (friends.size() == 1 ? " friend" : " friends"), scrollY);
+    }
+
+    private void rebuildProfilesPage() {
+        int scrollY = currentListScrollY();
+        listPanel.setVisible(false);
+        listPanel.removeAll();
+        int count = 0;
+        try {
+            listPanel.add(profilesCard());
+            count = profiles.list().size();
+        } catch (RuntimeException exception) {
+            showStatus("Could not read profiles: " + exception.getMessage(), true);
+        }
+        finishDedicatedPageRebuild(PROFILES,
+                count + (count == 1 ? " profile" : " profiles"), scrollY);
+    }
+
+    private JComponent profilesCard() {
+        SwingTheme.RoundedPanel card = new SwingTheme.RoundedPanel(16, CARD);
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setBorder(new EmptyBorder(SwingTheme.scale(22), SwingTheme.scale(24), SwingTheme.scale(22), SwingTheme.scale(24)));
+        card.setAlignmentX(0f);
+
+        JLabel title = new JLabel("Profiles");
+        title.setForeground(TEXT);
+        title.setFont(title.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(16f)));
+        title.setAlignmentX(0f);
+        card.add(title);
+
+        JLabel description = new JLabel("<html>Save the current module states, keybinds, settings, and "
+                + "global options as a named profile. Applying a profile pushes it live to the connected "
+                + "client. Modules not stored in a profile are left untouched.</html>");
+        description.setForeground(MUTED_TEXT);
+        description.setFont(description.getFont().deriveFont(SwingTheme.scaleFont(11.5f)));
+        description.setBorder(new EmptyBorder(SwingTheme.scale(5), 0, SwingTheme.scale(18), 0));
+        description.setAlignmentX(0f);
+        card.add(description);
+
+        JPanel saveRow = new JPanel(new BorderLayout(SwingTheme.scale(9), 0));
+        saveRow.setOpaque(false);
+        saveRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(38)));
+        saveRow.setAlignmentX(0f);
+        JTextField nameField = new JTextField();
+        styleValueField(nameField);
+        nameField.setHorizontalAlignment(SwingConstants.LEFT);
+        markInteractive(nameField);
+        SwingTheme.PillButton saveButton = new SwingTheme.PillButton("Save current", SwingTheme.ACCENT, SwingTheme.ACCENT_HOVER);
+        saveButton.setPreferredSize(new Dimension(SwingTheme.scale(128), SwingTheme.scale(34)));
+        Runnable saveAction = () -> {
+            if (saveProfile(nameField.getText())) {
+                nameField.setText("");
+                rebuildProfilesPage();
+            }
+        };
+        nameField.addActionListener(event -> saveAction.run());
+        saveButton.addActionListener(event -> saveAction.run());
+        saveRow.add(nameField, BorderLayout.CENTER);
+        saveRow.add(saveButton, BorderLayout.EAST);
+        card.add(saveRow);
+        card.add(Box.createVerticalStrut(SwingTheme.scale(8)));
+
+        JPanel transferRow = new JPanel(new FlowLayout(FlowLayout.LEFT, SwingTheme.scale(6), 0));
+        transferRow.setOpaque(false);
+        transferRow.setAlignmentX(0f);
+        SwingTheme.PillButton importButton = new SwingTheme.PillButton("Import profile", CARD_HOVER, CARD_BORDER);
+        importButton.setPreferredSize(new Dimension(SwingTheme.scale(118), SwingTheme.scale(32)));
+        importButton.addActionListener(event -> importProfile());
+        transferRow.add(importButton);
+        card.add(transferRow);
+        card.add(Box.createVerticalStrut(SwingTheme.scale(16)));
+
+        List<String> names = profiles.list();
+        if (names.isEmpty()) {
+            JLabel empty = new JLabel("No profiles saved yet.");
+            empty.setForeground(MUTED_TEXT);
+            empty.setFont(empty.getFont().deriveFont(SwingTheme.scaleFont(12f)));
+            empty.setAlignmentX(0f);
+            card.add(empty);
+        } else {
+            for (String name : names) {
+                card.add(profileRow(name));
+                card.add(Box.createVerticalStrut(SwingTheme.scale(8)));
+            }
+        }
+
+        int contentHeight = card.getPreferredSize().height;
+        card.setPreferredSize(new Dimension(SwingTheme.scale(10), contentHeight));
+        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, contentHeight));
+        return card;
+    }
+
+    private JComponent profileRow(String name) {
+        boolean active = name.equalsIgnoreCase(GuiPreferences.activeProfile());
+        JPanel row = new JPanel(new BorderLayout(SwingTheme.scale(12), 0));
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, SwingTheme.scale(40)));
+        row.setAlignmentX(0f);
+
+        JLabel label = new JLabel((active ? "●  " : "") + name);
+        label.setForeground(active ? SwingTheme.ACCENT : TEXT);
+        label.setFont(label.getFont().deriveFont(Font.BOLD, SwingTheme.scaleFont(13f)));
+        row.add(label, BorderLayout.WEST);
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, SwingTheme.scale(6), SwingTheme.scale(4)));
+        actions.setOpaque(false);
+
+        SwingTheme.PillButton apply = new SwingTheme.PillButton("Apply", SwingTheme.ACCENT, SwingTheme.ACCENT_HOVER);
+        apply.setPreferredSize(new Dimension(SwingTheme.scale(74), SwingTheme.scale(32)));
+        apply.setEnabled(agentHub.isConnected());
+        apply.setToolTipText(agentHub.isConnected() ? null : "Connect a client to apply a profile");
+        apply.addActionListener(event -> applyProfile(name));
+        actions.add(apply);
+
+        SwingTheme.PillButton rename = new SwingTheme.PillButton("Rename", CARD_HOVER, CARD_BORDER);
+        rename.setPreferredSize(new Dimension(SwingTheme.scale(80), SwingTheme.scale(32)));
+        rename.addActionListener(event -> renameProfile(name));
+        actions.add(rename);
+
+        SwingTheme.PillButton export = new SwingTheme.PillButton("Export", CARD_HOVER, CARD_BORDER);
+        export.setPreferredSize(new Dimension(SwingTheme.scale(76), SwingTheme.scale(32)));
+        export.addActionListener(event -> exportProfile(name));
+        actions.add(export);
+
+        SwingTheme.PillButton delete = new SwingTheme.PillButton("Delete", DANGER, DANGER_HOVER);
+        delete.setPreferredSize(new Dimension(SwingTheme.scale(78), SwingTheme.scale(32)));
+        delete.addActionListener(event -> deleteProfile(name));
+        actions.add(delete);
+
+        row.add(actions, BorderLayout.EAST);
+        return row;
+    }
+
+    private void exportProfile(String name) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Export Aurora profile");
+        chooser.setSelectedFile(new java.io.File(name + ".properties"));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path destination = chooser.getSelectedFile().toPath();
+        if (!destination.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".properties")) {
+            destination = destination.resolveSibling(destination.getFileName() + ".properties");
+        }
+        try {
+            profiles.exportTo(name, destination);
+            showStatus("Exported profile \"" + name + "\".", false);
+        } catch (RuntimeException exception) {
+            showStatus("Could not export profile: " + exception.getMessage(), true);
+        }
+    }
+
+    private void importProfile() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Import Aurora profile");
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        try {
+            String name = profiles.importFrom(chooser.getSelectedFile().toPath());
+            showStatus("Imported profile as \"" + name + "\".", false);
+            rebuildProfilesPage();
+        } catch (RuntimeException exception) {
+            showStatus("Could not import profile: " + exception.getMessage(), true);
+        }
+    }
+
+    /** Captures the current live module states plus global settings into a named profile. */
+    private boolean saveProfile(String rawName) {
+        String name = rawName == null ? "" : rawName.strip();
+        if (name.isEmpty()) {
+            showStatus("Enter a name to save the current setup as a profile.", true);
+            return false;
+        }
+        if (!ProfileStore.isValidName(name)) {
+            showStatus("Use up to 40 letters, numbers, spaces, hyphens, or underscores.", true);
+            return false;
+        }
+        if (modules.isEmpty()) {
+            showStatus("No module data yet; connect a client before saving a profile.", true);
+            return false;
+        }
+        if (profiles.exists(name)) {
+            int choice = javax.swing.JOptionPane.showConfirmDialog(this,
+                    "A profile named \"" + name + "\" already exists. Overwrite it?",
+                    "Overwrite profile", javax.swing.JOptionPane.YES_NO_OPTION);
+            if (choice != javax.swing.JOptionPane.YES_OPTION) {
+                return false;
+            }
+        }
+        Map<String, ProfileStore.ModuleState> captured = new LinkedHashMap<>();
+        for (ModuleView module : modules) {
+            Map<String, Double> settings = new LinkedHashMap<>();
+            for (SettingView setting : module.settings()) {
+                settings.put(setting.id(), setting.value());
+            }
+            captured.put(module.id(), new ProfileStore.ModuleState(module.enabled(), module.keybind(), settings));
+        }
+        try {
+            profiles.save(name, new ProfileStore.Snapshot(captured, GuiPreferences.silentAimCrosshairIndicator()));
+        } catch (RuntimeException exception) {
+            showStatus("Could not save profile: " + exception.getMessage(), true);
+            return false;
+        }
+        GuiPreferences.setActiveProfile(name);
+        showStatus("Saved profile \"" + name + "\".", false);
+        return true;
+    }
+
+    /** Pushes every stored module state and the global settings from a profile to the live agent. */
+    private void applyProfile(String name) {
+        if (!agentHub.isConnected()) {
+            showStatus("No client is connected; connect one to apply a profile.", true);
+            return;
+        }
+        ProfileStore.Snapshot snapshot;
+        try {
+            snapshot = profiles.load(name);
+        } catch (RuntimeException exception) {
+            showStatus("Could not read profile: " + exception.getMessage(), true);
+            return;
+        }
+        for (Map.Entry<String, ProfileStore.ModuleState> entry : snapshot.modules().entrySet()) {
+            ProfileStore.ModuleState state = entry.getValue();
+            agentHub.sendModuleUpdate(entry.getKey(), state.enabled(), state.keybind(),
+                    new LinkedHashMap<>(state.settings()));
+        }
+        GuiPreferences.setSilentAimCrosshairIndicator(snapshot.silentAimCrosshairIndicator());
+        agentHub.sendGlobalSettings(snapshot.silentAimCrosshairIndicator());
+        GuiPreferences.setActiveProfile(name);
+        // Force the next poll to rebuild from the agent's fresh module list.
+        lastModulesJson = "";
+        showStatus("Applied profile \"" + name + "\" to the connected client.", false);
+        rebuildProfilesPage();
+    }
+
+    private void renameProfile(String name) {
+        String input = javax.swing.JOptionPane.showInputDialog(this,
+                "New name for profile \"" + name + "\":", name);
+        if (input == null) {
+            return;
+        }
+        String newName = input.strip();
+        if (newName.equals(name)) {
+            return;
+        }
+        if (!ProfileStore.isValidName(newName)) {
+            showStatus("Use up to 40 letters, numbers, spaces, hyphens, or underscores.", true);
+            return;
+        }
+        if (profiles.exists(newName)) {
+            showStatus("A profile named \"" + newName + "\" already exists.", true);
+            return;
+        }
+        try {
+            profiles.rename(name, newName);
+        } catch (RuntimeException exception) {
+            showStatus("Could not rename profile: " + exception.getMessage(), true);
+            return;
+        }
+        if (name.equalsIgnoreCase(GuiPreferences.activeProfile())) {
+            GuiPreferences.setActiveProfile(newName);
+        }
+        showStatus("Renamed profile to \"" + newName + "\".", false);
+        rebuildProfilesPage();
+    }
+
+    private void deleteProfile(String name) {
+        int choice = javax.swing.JOptionPane.showConfirmDialog(this,
+                "Delete profile \"" + name + "\"? This cannot be undone.",
+                "Delete profile", javax.swing.JOptionPane.YES_NO_OPTION);
+        if (choice != javax.swing.JOptionPane.YES_OPTION) {
+            return;
+        }
+        try {
+            profiles.delete(name);
+        } catch (RuntimeException exception) {
+            showStatus("Could not delete profile: " + exception.getMessage(), true);
+            return;
+        }
+        if (name.equalsIgnoreCase(GuiPreferences.activeProfile())) {
+            GuiPreferences.setActiveProfile("");
+        }
+        showStatus("Deleted profile \"" + name + "\".", false);
+        rebuildProfilesPage();
     }
 
     private int currentListScrollY() {
@@ -1075,6 +1477,7 @@ public final class ControlPanelGui extends JFrame {
 
     private JComponent moduleCard(ModuleView module, int index, int total) {
         boolean expanded = expandedModules.contains(module.id());
+        boolean panicActive = modules.stream().anyMatch(entry -> "panic".equals(entry.id()) && entry.enabled());
         boolean rainbow = GuiPreferences.rainbowModules();
         final Color cardColor;
         final Color hoverColor;
@@ -1139,8 +1542,19 @@ public final class ControlPanelGui extends JFrame {
         controls.add(bind);
         SwingTheme.ToggleSwitch toggle = new SwingTheme.ToggleSwitch(module.enabled());
         if (module.enabled()) toggle.setCheckedTrackColor(CARD);
-        toggle.setToolTipText(module.enabled() ? "Disable module" : "Enable module");
-        toggle.onChange(value -> sendUpdate(module.id(), value, null, Map.of()));
+        boolean enableLockedByPanic = panicActive && !"panic".equals(module.id());
+        toggle.setEnabled(!enableLockedByPanic);
+        toggle.setToolTipText(enableLockedByPanic
+                ? "Panic is active; disable Panic before enabling this module"
+                : module.enabled() ? "Disable module" : "Enable module");
+        toggle.onChange(value -> {
+            if (value && module.requiresKeybind() && module.keybind() < 0) {
+                toggle.setChecked(false);
+                showStatus(module.displayName() + " must be bound before it can be enabled.", true);
+                return;
+            }
+            sendUpdate(module.id(), value, null, Map.of());
+        });
         markInteractive(toggle);
         controls.add(toggle);
         JButton expand = iconButton(expanded ? "⌃" : "⌄");
@@ -1324,6 +1738,8 @@ public final class ControlPanelGui extends JFrame {
             holder.setOpaque(false);
             holder.add(toggle);
             row.add(holder, BorderLayout.CENTER);
+        } else if ("entity_list".equals(setting.type())) {
+            row.add(entityPicker(module.id(), setting, reset), BorderLayout.CENTER);
         } else {
             JComboBox<String> options = new JComboBox<>(setting.options().toArray(String[]::new));
             styleComboBox(options);
@@ -1337,6 +1753,50 @@ public final class ControlPanelGui extends JFrame {
         }
         row.add(reset, BorderLayout.EAST);
         return row;
+    }
+
+    private JComponent entityPicker(String moduleId, SettingView setting, JButton reset) {
+        JButton picker = new JButton();
+        picker.setHorizontalAlignment(SwingConstants.LEFT);
+        picker.setFocusable(true);
+        picker.setBackground(FIELD);
+        picker.setForeground(TEXT);
+        picker.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(CARD_BORDER),
+                new EmptyBorder(SwingTheme.scale(6), SwingTheme.scale(10),
+                        SwingTheme.scale(6), SwingTheme.scale(10))));
+        markInteractive(picker);
+        int[] mask = {(int) Math.round(setting.value())};
+        Runnable updateLabel = () -> {
+            List<String> selected = new ArrayList<>();
+            for (int i = 0; i < setting.options().size(); i++) {
+                if ((mask[0] & (1 << i)) != 0) selected.add(setting.options().get(i));
+            }
+            picker.setText(selected.isEmpty() ? "No entities selected" : String.join(", ", selected));
+            picker.setToolTipText(picker.getText());
+        };
+        updateLabel.run();
+        picker.addActionListener(event -> {
+            JPopupMenu menu = new JPopupMenu();
+            for (int i = 0; i < setting.options().size(); i++) {
+                int bit = 1 << i;
+                JCheckBoxMenuItem item = new JCheckBoxMenuItem(setting.options().get(i), (mask[0] & bit) != 0);
+                item.addActionListener(selected -> {
+                    mask[0] = item.isSelected() ? mask[0] | bit : mask[0] & ~bit;
+                    updateLabel.run();
+                    sendUpdate(moduleId, null, null, Map.of(setting.id(), (double) mask[0]));
+                });
+                menu.add(item);
+            }
+            menu.show(picker, 0, picker.getHeight());
+        });
+        reset.addActionListener(event -> {
+            mask[0] = (int) Math.round(setting.defaultValue());
+            updateLabel.run();
+            sendUpdate(moduleId, null, null, Map.of(setting.id(), (double) mask[0]));
+            showStatus(setting.displayName() + " reset to default", false);
+        });
+        return picker;
     }
 
     private JComponent numberEditor(String moduleId, SettingView setting, JButton reset) {
@@ -2155,7 +2615,7 @@ public final class ControlPanelGui extends JFrame {
     }
 
     private record ModuleView(String id, String displayName, String category, String description,
-                              boolean enabled, int keybind, List<SettingView> settings) {
+                              boolean enabled, int keybind, boolean requiresKeybind, List<SettingView> settings) {
         static ModuleView from(Map<?, ?> map) {
             List<SettingView> settings = new ArrayList<>();
             if (map.get("settings") instanceof List<?> entries) {
@@ -2166,6 +2626,7 @@ public final class ControlPanelGui extends JFrame {
             return new ModuleView(string(map, "id", "unknown"), string(map, "displayName", "Unnamed"),
                     string(map, "category", "Misc"), string(map, "description", ""),
                     Boolean.TRUE.equals(map.get("enabled")), integer(map.get("keybind"), KeybindCodec.UNBOUND),
+                    Boolean.TRUE.equals(map.get("requiresKeybind")),
                     List.copyOf(settings));
         }
 
@@ -2191,6 +2652,12 @@ public final class ControlPanelGui extends JFrame {
         String displayValue() {
             if ("boolean".equals(type)) return value >= 0.5D ? "On" : "Off";
             if ("color".equals(type)) return GuiPreferences.formatColor(new Color((int) Math.round(value) & 0xFFFFFF));
+            if ("entity_list".equals(type)) {
+                int mask = (int) Math.round(value);
+                long count = java.util.stream.IntStream.range(0, options.size())
+                        .filter(index -> (mask & (1 << index)) != 0).count();
+                return count + " selected";
+            }
             if ("option".equals(type) && !options.isEmpty()) {
                 return options.get(Math.max(0, Math.min(options.size() - 1, (int) Math.round(value))));
             }

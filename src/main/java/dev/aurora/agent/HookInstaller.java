@@ -18,6 +18,7 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.BooleanSupplier;
 import java.util.concurrent.atomic.AtomicBoolean;
+import dev.aurora.input.GameplayInputGate;
 
 public final class HookInstaller {
     private static final List<String> MOUSE_CLASSES = List.of(
@@ -67,6 +68,15 @@ public final class HookInstaller {
             "net.minecraft.client.input.KeyboardInput",
             "net.minecraft.class_743",
             "gkw"
+    );
+    private static final List<String> KEYBOARD_CLASSES = List.of(
+            "net.minecraft.client.KeyboardHandler",
+            "net.minecraft.client.Keyboard",
+            "net.minecraft.class_309",
+            "flj", "gfi"
+    );
+    private static final List<String> KEYBOARD_KEY_METHODS = List.of(
+            "keyPress", "onKey", "method_1466", "a"
     );
     private static final List<String> WORLD_RENDER_CLASSES = List.of(
             "net.minecraft.client.render.WorldRenderer",
@@ -169,8 +179,12 @@ public final class HookInstaller {
                     public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
                                                             ClassLoader classLoader, JavaModule module,
                                                             ProtectionDomain protectionDomain) {
-                        return builder.visit(Advice.to(RenderAdvice.class).on(
-                                namedMethodAny(profile.renderMethods()).and(ElementMatchers.takesArguments(2))));
+                        return builder
+                                .visit(Advice.to(RenderAdvice.class).on(
+                                        namedMethodAny(profile.renderMethods()).and(ElementMatchers.takesArguments(2))))
+                                .visit(Advice.to(AntiDebuffAdvice.class).on(namedMethodAny(List.of(
+                                        "renderVignette", "renderVignetteOverlay", "method_1735",
+                                        "renderConfusionOverlay", "renderNauseaOverlay", "method_61980"))));
                     }
                 })
                 .type(namedTypeAny(profile.worldRenderClasses()))
@@ -225,6 +239,16 @@ public final class HookInstaller {
                         return builder.visit(Advice.to(MovementInputAdvice.class).on(namedMethodAny(INPUT_TICK_METHODS)));
                     }
                 })
+                .type(namedTypeAny(KEYBOARD_CLASSES))
+                .transform(new AgentBuilder.Transformer() {
+                    @Override
+                    public DynamicType.Builder<?> transform(DynamicType.Builder<?> builder, TypeDescription typeDescription,
+                                                            ClassLoader classLoader, JavaModule module,
+                                                            ProtectionDomain protectionDomain) {
+                        return builder.visit(Advice.to(KeyboardAdvice.class).on(namedMethodAny(KEYBOARD_KEY_METHODS)
+                                .and(ElementMatchers.takesArguments(5).or(ElementMatchers.takesArguments(3)))));
+                    }
+                })
                 .type(namedTypeAny(profile.packetClasses()))
                 .transform(new AgentBuilder.Transformer() {
                     @Override
@@ -262,6 +286,7 @@ public final class HookInstaller {
                 || profile.entityClasses().contains(className)
                 || profile.cameraClasses().contains(className)
                 || KEYBOARD_INPUT_CLASSES.contains(className)
+                || KEYBOARD_CLASSES.contains(className)
                 || profile.worldRenderClasses().contains(className);
     }
 
@@ -332,6 +357,14 @@ public final class HookInstaller {
         }
     }
 
+    public static final class AntiDebuffAdvice {
+        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
+        public static boolean onEnter() {
+            Object callback = System.getProperties().get(HookDispatch.ANTI_DEBUFF_CALLBACK_KEY);
+            return callback instanceof BooleanSupplier supplier && supplier.getAsBoolean();
+        }
+    }
+
     public static final class AttackSuppressionAdvice {
         @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
         public static boolean onEnter() {
@@ -349,6 +382,17 @@ public final class HookInstaller {
     }
 
     public static final class WorldRenderAdvice {
+        @Advice.OnMethodEnter(suppress = Throwable.class)
+        public static void onEnter(@Advice.AllArguments Object[] arguments) {
+            if (arguments == null || arguments.length == 0) return;
+            Object callback = System.getProperties().get(HookDispatch.WORLD_PROJECTION_CALLBACK_KEY);
+            if (callback instanceof Consumer<?> consumer) {
+                @SuppressWarnings("unchecked")
+                Consumer<Object[]> projectionCallback = (Consumer<Object[]>) consumer;
+                projectionCallback.accept(arguments);
+            }
+        }
+
         @Advice.OnMethodExit(suppress = Throwable.class)
         public static void onExit(@Advice.AllArguments Object[] arguments) {
             if (arguments == null || arguments.length < 2) {
@@ -363,22 +407,35 @@ public final class HookInstaller {
         }
     }
 
+
     public static final class MouseButtonAdvice {
         @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
         public static boolean onEnter() {
-            return Boolean.TRUE.equals(System.getProperties().get("dev.aurora.gui.open"));
+            return GameplayInputGate.isActive()
+                    || Boolean.TRUE.equals(System.getProperties().get("dev.aurora.gui.open"));
         }
     }
 
     public static final class MouseScrollAdvice {
-        @Advice.OnMethodEnter(suppress = Throwable.class)
-        public static void onEnter(@Advice.Argument(2) double vertical) {
+        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
+        public static boolean onEnter(@Advice.Argument(2) double vertical) {
+            if (GameplayInputGate.isActive()) {
+                return true;
+            }
             Object callback = System.getProperties().get("dev.aurora.hook.scroll");
             if (callback instanceof Consumer<?> consumer) {
                 @SuppressWarnings("unchecked")
                 Consumer<Double> scrollCallback = (Consumer<Double>) consumer;
                 scrollCallback.accept(vertical);
             }
+            return false;
+        }
+    }
+
+    public static final class KeyboardAdvice {
+        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
+        public static boolean onEnter() {
+            return GameplayInputGate.isActive();
         }
     }
 

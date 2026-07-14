@@ -36,12 +36,19 @@ public final class AuroraAgent {
                 controller.handleIpc(message);
             }
         });
+        RuntimeController controller = RuntimeController.install(instrumentation, ipc, arguments.minecraftVersion());
+        CONTROLLER.set(controller);
+        // Register the controller before connecting. The injector sends the persisted friends
+        // list immediately after the IPC handshake; connecting earlier could deliver that
+        // message while CONTROLLER is still null, causing it to be silently discarded.
         boolean connected = ipc.connect();
         if (!connected) {
             System.err.println("[Aurora] Running without injector IPC. Use the localhost UI or provide agent args to control modules.");
+        } else {
+            // install() publishes the module list before the IPC connection exists. Publish the
+            // initial snapshot again after connecting so the control panel does not start empty.
+            controller.publishInitialState();
         }
-        RuntimeController controller = RuntimeController.install(instrumentation, ipc, arguments.minecraftVersion());
-        CONTROLLER.set(controller);
         ipc.log("INFO", "Aurora agent installed for Minecraft "
                 + (arguments.minecraftVersion().isBlank() ? "auto/unknown" : arguments.minecraftVersion()));
         ipc.send(IpcMessage.Type.STATUS, "{\"attached\":true,\"message\":\"Aurora agent installed\"}");

@@ -21,4 +21,5 @@ class GuiPreferencesTest {
         assertThrows(IllegalArgumentException.class, () -> GuiPreferences.parseColor("blue"));
         assertThrows(IllegalArgumentException.class, () -> GuiPreferences.parseColor("#123"));
     }
+
 }

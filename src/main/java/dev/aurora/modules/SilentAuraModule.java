@@ -34,7 +34,6 @@ public final class SilentAuraModule extends AbstractModule {
     private static final double STRAFE_TARGET_RESPONSE = 52.0D;
     private static final double PERFECT_COOLDOWN_THRESHOLD = 0.99D;
     private static final double PERFECT_EARLY_COOLDOWN_THRESHOLD = 0.848D;
-    private static final double CRYSTAL_COMBO_COOLDOWN_THRESHOLD = 0.848D;
 
     private final MinecraftBridge minecraft;
     private final ModuleSetting rangeMin;
@@ -58,7 +57,6 @@ public final class SilentAuraModule extends AbstractModule {
     private final AimPointDrift chinDrift = new AimPointDrift(0.10D, 0.07D, 0.16D, 600L, 1_700L);
     private final AimPointDrift microDrift = new AimPointDrift(0.025D, 0.018D, 0.24D, 150L, 350L);
 
-    private CrystalComboController crystalComboController;
     private String targetId;
     private String pendingAttackTargetId;
     private long pendingAttackAt;
@@ -114,10 +112,6 @@ public final class SilentAuraModule extends AbstractModule {
      * or is disabled. Consumed by the target-ring renderer so it can anchor to the live target. */
     public String currentAimTargetId() {
         return enabled() ? targetId : null;
-    }
-
-    public void bindCrystalComboController(CrystalComboController crystalComboController) {
-        this.crystalComboController = crystalComboController;
     }
 
     public boolean suppressPhysicalHeldAttack() {
@@ -283,23 +277,12 @@ public final class SilentAuraModule extends AbstractModule {
         if (critical.needsSprintReset() && !critSprintReset.readyToCrit(combat)) {
             return;
         }
-        boolean queueCrystalCombo = shouldQueueCrystalCombo(target);
         if (realClickAttack(target)) {
             critSprintReset.complete();
             perfectTiming = rollPerfectTiming();
             missRolled = false;
-            if (queueCrystalCombo) {
-                crystalComboController.queueSilentAuraCombo(target.id());
-            }
         }
         clearPendingAttack();
-    }
-
-    private boolean shouldQueueCrystalCombo(AimTarget target) {
-        return crystalComboController != null
-                && target != null
-                && minecraft.attackCooldown() >= CRYSTAL_COMBO_COOLDOWN_THRESHOLD
-                && crystalComboController.canStartSilentAuraCombo(target.id());
     }
 
     /**

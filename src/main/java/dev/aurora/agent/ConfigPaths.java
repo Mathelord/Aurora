@@ -5,12 +5,17 @@ import java.util.Locale;
 
 /** Resolves the per-user Aurora config location, independent of whichever Minecraft instance
  * the agent happens to be injected into. */
-final class ConfigPaths {
+public final class ConfigPaths {
     private ConfigPaths() {
     }
 
     static Path configFile() {
         return configDir().resolve("config.properties");
+    }
+
+    /** Directory holding named configuration profiles, alongside the active config.properties. */
+    public static Path profilesDir() {
+        return configDir().resolve("profiles");
     }
 
     private static Path configDir() {

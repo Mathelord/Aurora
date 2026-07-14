@@ -40,7 +40,7 @@ public final class BackTrackModule extends AbstractModule {
     }
 
     BackTrackModule(MinecraftBridge minecraft, PacketRelay relay, PlayerAttackPackets attackPackets) {
-        super("back-track", "BackTrack", "Combat",
+        super("back-track", "BackTrack", "Network",
                 "Briefly delays player updates after an attack so previous positions remain hittable.");
         this.minecraft = Objects.requireNonNull(minecraft, "minecraft");
         this.relay = Objects.requireNonNull(relay, "relay");

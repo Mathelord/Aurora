@@ -27,12 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 class SilentAuraModuleTest {
     private final StubBridge bridge = new StubBridge();
     private final SilentAuraModule module = new SilentAuraModule(bridge);
-    private final StubCrystalComboController crystalComboController = new StubCrystalComboController();
 
     @BeforeEach
     void wireClickSimulator() {
         RealClickSimulator.init(bridge);
-        module.bindCrystalComboController(crystalComboController);
     }
 
     @AfterEach
@@ -89,17 +87,6 @@ class SilentAuraModuleTest {
 
         assertEquals(1, bridge.clicks);
         assertNull(bridge.attackedTarget);
-    }
-
-    @Test
-    void queuesCrystalComboAfterSuccessfulAttackWhenControllerAllowsIt() {
-        set("perfect-early", 0.0D);
-        set("perfect-late", 0.0D);
-        module.setEnabled(true);
-
-        module.onTick(TickEvent.now());
-
-        assertEquals("target", crystalComboController.queuedTargetId);
     }
 
     @Test
@@ -216,18 +203,4 @@ class SilentAuraModuleTest {
         }
     }
 
-    private static final class StubCrystalComboController implements CrystalComboController {
-        private String queuedTargetId;
-
-        @Override
-        public boolean canStartSilentAuraCombo(String targetId) {
-            return "target".equals(targetId);
-        }
-
-        @Override
-        public boolean queueSilentAuraCombo(String targetId) {
-            queuedTargetId = targetId;
-            return true;
-        }
-    }
 }

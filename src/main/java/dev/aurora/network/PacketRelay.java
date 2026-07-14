@@ -31,14 +31,6 @@ public final class PacketRelay {
             "net.minecraft.network.packet.s2c.play.EntityS2CPacket",
             "net.minecraft.class_2684"
     );
-    private static final Set<String> PROTOCOL_CRITICAL_INBOUND_CLASSES = Set.of(
-            // KeepAliveS2CPacket: named, intermediary, official 1.21.4, official 1.21.11.
-            "net.minecraft.network.packet.s2c.common.KeepAliveS2CPacket",
-            "net.minecraft.class_2670", "zg", "abl",
-            // CommonPingS2CPacket drives the transaction-style CommonPongC2SPacket response.
-            "net.minecraft.network.packet.s2c.common.CommonPingS2CPacket",
-            "net.minecraft.class_6373", "zh", "abm"
-    );
     private static final double DELTA_PER_BLOCK = 4096.0D;
     private static final int MAX_HELD_INBOUND = 8192;
     private static final int MAX_HELD_OUTBOUND = 512;
@@ -157,11 +149,6 @@ public final class PacketRelay {
      * Minecraft, avoiding a reflective lookup through {@code ClientConnection} during replay. */
     public boolean captureInbound(Object listener, Object packet) {
         if (listener == null || packet == null) {
-            return false;
-        }
-        // These packets exist solely to solicit a time-sensitive client response. Holding them
-        // causes anti-cheats and vanilla timeout handling to treat the connection as unresponsive.
-        if (hasTypeName(packet, PROTOCOL_CRITICAL_INBOUND_CLASSES)) {
             return false;
         }
         pruneExpiredInboundRequests();

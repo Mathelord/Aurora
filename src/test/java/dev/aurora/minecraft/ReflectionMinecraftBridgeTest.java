@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ReflectionMinecraftBridgeTest {
+
     @Test
     void resolvesAimPointAtEclipseChinHeight() {
         Vec3 point = ReflectionMinecraftBridge.chinAimPoint(2.0D, 10.0D, -3.0D,

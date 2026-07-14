@@ -58,6 +58,11 @@ public final class AgentConnectionHub implements AutoCloseable {
         return eventSampleJson;
     }
 
+    /** Whether an agent is currently connected and able to receive live updates. */
+    public boolean isConnected() {
+        return connection.get() != null;
+    }
+
     public boolean sendModuleUpdate(String moduleId, Boolean enabled, Map<String, Double> settings) {
         return sendModuleUpdate(moduleId, enabled, null, settings);
     }
@@ -86,8 +91,22 @@ public final class AgentConnectionHub implements AutoCloseable {
         AgentConnection active = connection.get();
         if (active == null) return false;
         active.send(new IpcMessage(IpcMessage.Type.GLOBAL_SETTINGS,
-                Json.object(Map.of("silentAimCrosshairIndicator", silentAimCrosshairIndicator))));
+                globalSettingsJson(silentAimCrosshairIndicator)));
         return true;
+    }
+
+    public boolean sendGlobalSettings() {
+        return sendGlobalSettings(GuiPreferences.silentAimCrosshairIndicator());
+    }
+
+    private static String globalSettingsJson(boolean silentAimCrosshairIndicator) {
+        return Json.object(Map.of(
+                "silentAimCrosshairIndicator", silentAimCrosshairIndicator,
+                "notificationsEnabled", GuiPreferences.notificationsEnabled(),
+                "notificationRadius", GuiPreferences.notificationRadius(),
+                "notificationBlur", GuiPreferences.notificationBlur(),
+                "notificationOpacity", GuiPreferences.notificationOpacity(),
+                "notificationDurationMillis", GuiPreferences.notificationDurationMillis()));
     }
 
     /** Pushes the friends list to the agent so combat modules and ESP can honor it. */
@@ -126,7 +145,7 @@ public final class AgentConnectionHub implements AutoCloseable {
             statusJson = Json.object(Map.of("attached", true, "message", "Agent connected", "hello", hello.payload()));
             logs.add("INFO", "Agent connected");
             agentConnection.send(new IpcMessage(IpcMessage.Type.GLOBAL_SETTINGS,
-                    Json.object(Map.of("silentAimCrosshairIndicator", GuiPreferences.silentAimCrosshairIndicator()))));
+                    globalSettingsJson(GuiPreferences.silentAimCrosshairIndicator())));
             agentConnection.send(new IpcMessage(IpcMessage.Type.FRIENDS,
                     Json.array(GuiPreferences.friends())));
 

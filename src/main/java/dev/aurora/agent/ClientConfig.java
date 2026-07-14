@@ -39,16 +39,16 @@ final class ClientConfig {
         Properties properties = load(onError);
         for (ClientModule module : modules.modules()) {
             String prefix = module.id() + ".";
-            String enabledValue = properties.getProperty(prefix + "enabled");
-            if (enabledValue != null) {
-                module.setEnabled(Boolean.parseBoolean(enabledValue));
-            }
             String keybindValue = properties.getProperty(prefix + "keybind");
             if (keybindValue != null) {
                 try {
                     module.setKeybind(Integer.parseInt(keybindValue));
                 } catch (NumberFormatException ignored) {
                 }
+            }
+            String enabledValue = properties.getProperty(prefix + "enabled");
+            if (enabledValue != null && (!module.requiresKeybind() || module.keybind() >= 0)) {
+                module.setEnabled(Boolean.parseBoolean(enabledValue));
             }
             for (ModuleSetting setting : module.settings()) {
                 String settingValue = properties.getProperty(prefix + setting.id());

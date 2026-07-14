@@ -14,6 +14,7 @@ import java.util.function.Consumer;
 public final class ModuleManager {
     private final Map<String, ClientModule> modules = new LinkedHashMap<>();
     private final Consumer<String> diagnosticSink;
+    private String panicModuleId;
 
     public ModuleManager() {
         this(message -> System.err.println("[Aurora] " + message));
@@ -28,6 +29,9 @@ public final class ModuleManager {
             throw new IllegalArgumentException("duplicate module id: " + module.id());
         }
         modules.put(module.id(), module);
+        if (module.id().equals("panic")) {
+            panicModuleId = module.id();
+        }
     }
 
     public synchronized Collection<ClientModule> modules() {
@@ -45,6 +49,14 @@ public final class ModuleManager {
     public synchronized boolean update(String id, Boolean enabled, Integer keybind, Map<String, Double> settings) {
         ClientModule module = modules.get(id);
         if (module == null) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(enabled) && module.requiresKeybind() && module.keybind() < 0) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(enabled) && panicModuleId != null
+                && !module.id().equals(panicModuleId)
+                && modules.get(panicModuleId).enabled()) {
             return false;
         }
         for (ModuleSetting setting : module.settings()) {

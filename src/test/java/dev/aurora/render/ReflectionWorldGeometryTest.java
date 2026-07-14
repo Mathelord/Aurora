@@ -57,7 +57,65 @@ class ReflectionWorldGeometryTest {
 
         assertEquals(List.of(new Vec3(1, 2, 3), new Vec3(4, 6, 8)), providers.consumer.vertices);
         assertEquals(2, providers.consumer.normals);
+        assertEquals(List.of(1.0F, 1.0F), providers.consumer.lineWidths);
         assertEquals(1, providers.flushes);
+    }
+
+    @Test
+    void supportsMinecraft12111PackedArgbVertexColor() {
+        FakeMatrices matrices = new FakeMatrices();
+        PackedColorProviders providers = new PackedColorProviders();
+        CameraPose camera = new CameraPose(true, Vec3.ZERO, 0.0F, 0.0F, 70.0, 1920, 1080);
+        WorldGeometryBatch.Quad quad = new WorldGeometryBatch.Quad(
+                Vec3.ZERO, new Vec3(1, 0, 0), new Vec3(1, 1, 0), new Vec3(0, 1, 0),
+                0x7F123456);
+
+        assertTrue(ReflectionWorldGeometry.draw(matrices, providers, camera, List.of(quad), List.of()));
+
+        assertEquals(List.of(0x7F123456, 0x7F123456, 0x7F123456, 0x7F123456),
+                providers.consumer.colors);
+    }
+
+    @Test
+    void flushesEachUsedLayerOnlyOnce() {
+        FakeMatrices matrices = new FakeMatrices();
+        FakeProviders providers = new FakeProviders();
+        CameraPose camera = new CameraPose(true, Vec3.ZERO, 0.0F, 0.0F, 70.0, 1920, 1080);
+        WorldGeometryBatch.Quad quad = new WorldGeometryBatch.Quad(
+                Vec3.ZERO, new Vec3(1, 0, 0), new Vec3(1, 1, 0), new Vec3(0, 1, 0),
+                0x80112233);
+        WorldGeometryBatch.Line line = new WorldGeometryBatch.Line(
+                Vec3.ZERO, new Vec3(1, 1, 1), 0xFF445566);
+
+        assertTrue(ReflectionWorldGeometry.draw(
+                matrices, providers, camera, List.of(quad, quad), List.of(line, line)));
+
+        assertEquals(2, providers.flushes);
+        assertEquals(12, providers.consumer.vertices);
+    }
+
+    @Test
+    void combinesNormalAndThroughWallFallbackQuadsAndDoesNotReplayFlushedGeometry() {
+        FakeMatrices matrices = new FakeMatrices();
+        FakeProviders providers = new FakeProviders();
+        CameraPose camera = new CameraPose(true, Vec3.ZERO, 0.0F, 0.0F, 70.0, 1920, 1080);
+        WorldGeometryBatch batch = new WorldGeometryBatch(matrices, providers, camera);
+        batch.quad(Vec3.ZERO, new Vec3(1, 0, 0), new Vec3(1, 1, 0), new Vec3(0, 1, 0),
+                0x80112233);
+        batch.espBox(Vec3.ZERO, new Vec3(1, 2, 1), 0x40334455, 0xFF667788);
+
+        assertTrue(batch.flush());
+
+        // The test fixture has no custom no-depth RenderLayer. All seven fills therefore share one
+        // debug-quad flush, and all twelve edges share one line flush.
+        assertEquals(2, providers.flushes);
+        assertEquals(52, providers.consumer.vertices);
+        assertEquals(0, batch.quadCount());
+        assertEquals(0, batch.lineCount());
+
+        assertTrue(batch.flush());
+        assertEquals(2, providers.flushes);
+        assertEquals(52, providers.consumer.vertices);
     }
 
     public static final class FakeMatrices {
@@ -120,6 +178,7 @@ class ReflectionWorldGeometryTest {
 
     public static final class ModernConsumer {
         private final List<Vec3> vertices = new ArrayList<>();
+        private final List<Float> lineWidths = new ArrayList<>();
         private int normals;
 
         public ModernConsumer method_22912(float x, float y, float z) {
@@ -133,6 +192,39 @@ class ReflectionWorldGeometryTest {
 
         public ModernConsumer method_22914(float x, float y, float z) {
             normals++;
+            return this;
+        }
+
+        public ModernConsumer method_75298(float width) {
+            lineWidths.add(width);
+            return this;
+        }
+    }
+
+    public static final class PackedColorProviders {
+        private final PackedColorConsumer consumer = new PackedColorConsumer();
+
+        public PackedColorConsumer method_73477(class_1921 ignored) {
+            return consumer;
+        }
+
+        public void method_22994(class_1921 ignored) {
+        }
+    }
+
+    public static final class PackedColorConsumer {
+        private final List<Integer> colors = new ArrayList<>();
+
+        public PackedColorConsumer method_22912(float x, float y, float z) {
+            return this;
+        }
+
+        public PackedColorConsumer method_39415(int argb) {
+            colors.add(argb);
+            return this;
+        }
+
+        public PackedColorConsumer method_22914(float x, float y, float z) {
             return this;
         }
     }

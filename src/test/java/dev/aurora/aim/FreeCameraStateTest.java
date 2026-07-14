@@ -22,6 +22,20 @@ class FreeCameraStateTest {
     }
 
     @Test
+    void bodyRotationCanFollowAimWithoutMovingDetachedView() {
+        FreeCameraState state = new FreeCameraState();
+        state.activate(new AimAngles(10.0F, 5.0F), new AimAngles(30.0F, -5.0F),
+                0.0D, 0.0D, 0.0D, false);
+
+        state.updateBodyAngles(new AimAngles(80.0F, 12.0F));
+
+        assertEquals(80.0F, state.bodyAngles().yaw(), 1.0e-4);
+        assertEquals(12.0F, state.bodyAngles().pitch(), 1.0e-4);
+        assertEquals(30.0F, state.viewAngles().yaw(), 1.0e-4);
+        assertEquals(-5.0F, state.viewAngles().pitch(), 1.0e-4);
+    }
+
+    @Test
     void pitchIsClampedToVerticalLimits() {
         FreeCameraState state = new FreeCameraState();
         state.activate(new AimAngles(0.0F, 0.0F), new AimAngles(0.0F, 0.0F), 0.0D, 0.0D, 0.0D, false);

@@ -29,7 +29,6 @@ public final class TextGuiModule extends AbstractModule {
     private static final int LINE_HEIGHT = 9;
     private static final int ROW_GAP = 2;
     private static final int ACCENT_WIDTH = 2;
-    private static final int CORNER_RADIUS = 3;
     private static final int BACKGROUND_RGB = 0x101018;
     private static final int TEXT_RGB = 0xF2F2F7;
     private static final int DEFAULT_ACCENT = 0x1866DF;
@@ -45,6 +44,9 @@ public final class TextGuiModule extends AbstractModule {
     private final ModuleSetting accentColor;
     private final ModuleSetting rainbow;
     private final ModuleSetting background;
+    private final ModuleSetting surface;
+    private final ModuleSetting blurRadius;
+    private final ModuleSetting cornerRadius;
     private final ModuleSetting showSelf;
     private Instant lastFrame;
 
@@ -65,6 +67,16 @@ public final class TextGuiModule extends AbstractModule {
                 .description("Animates a slow color gradient along the accent edges.");
         background = booleanSetting("background", "Background", true)
                 .description("Draws a translucent near-black surface behind each module.");
+        surface = optionSetting("surface", "Surface", Surface.FROSTED.ordinal(),
+                List.of("Frosted glass", "Solid"))
+                .description("Uses real framebuffer blur when the graphics pipeline supports it.")
+                .visibleWhen(() -> enabled(background));
+        blurRadius = setting("blur-radius", "Blur radius", 12.0D, 4.0D, 40.0D, 1.0D)
+                .description("Strength of the frosted-glass background blur.")
+                .visibleWhen(() -> enabled(background) && option(surface, Surface.values()) == Surface.FROSTED);
+        cornerRadius = setting("corner-radius", "Corner radius", 5.0D, 0.0D, 10.0D, 1.0D)
+                .description("Rounding of each module surface.")
+                .visibleWhen(() -> enabled(background));
         showSelf = booleanSetting("show-self", "Show Text GUI", false)
                 .description("Includes Text GUI itself in the module list.");
     }
@@ -114,8 +126,16 @@ public final class TextGuiModule extends AbstractModule {
             int alpha = clampAlpha((int) Math.round(255.0D * eased));
 
             if (enabled(background)) {
-                minecraft.fillRounded(event.context(), left, y, right, y + height, CORNER_RADIUS,
-                        argb(scaleAlpha(0xB8, alpha), BACKGROUND_RGB));
+                int radius = (int) Math.round(cornerRadius.value());
+                boolean frosted = option(surface, Surface.values()) == Surface.FROSTED
+                        && minecraft.drawFrostedPanel(event.context(), left, y, right, y + height,
+                        radius, (float) blurRadius.value(),
+                        argb(scaleAlpha(0x72, alpha), BACKGROUND_RGB),
+                        argb(scaleAlpha(0x38, alpha), 0xFFFFFF));
+                if (!frosted) {
+                    minecraft.fillRounded(event.context(), left, y, right, y + height, radius,
+                            argb(scaleAlpha(0xB8, alpha), BACKGROUND_RGB));
+                }
             }
             int accent = accentColor(now, rowIndex);
             if (selectedPosition == Position.TOP_RIGHT) {
@@ -222,6 +242,7 @@ public final class TextGuiModule extends AbstractModule {
 
     private enum Position { TOP_RIGHT, TOP_LEFT }
     private enum Sorting { WIDTH, ALPHABETICAL }
+    private enum Surface { FROSTED, SOLID }
 
     private static final class AnimatedRow {
         private final String id;

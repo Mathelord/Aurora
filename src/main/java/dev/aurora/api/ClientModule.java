@@ -24,6 +24,11 @@ public interface ClientModule {
 
     void setKeybind(int keyCode);
 
+    /** Whether the module may only be enabled when it has a keybind. */
+    default boolean requiresKeybind() {
+        return false;
+    }
+
     /**
      * Whether this module's keybind should act as a momentary hold (enabled only while the key is
      * held, disabled on release) instead of the default press-to-toggle behaviour. Modules that

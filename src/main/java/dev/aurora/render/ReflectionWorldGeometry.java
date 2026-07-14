@@ -3,17 +3,28 @@ package dev.aurora.render;
 import dev.aurora.aim.Vec3;
 import dev.aurora.minecraft.CameraPose;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
-/** Reflection adapter for Minecraft 1.21.4's world-space vertex/render-layer APIs. */
+/**
+ * Reflection bootstrap for Minecraft's world-space vertex and render-layer APIs.
+ *
+ * <p>Reflection is deliberately restricted to the one-time access-plan construction. Frame and
+ * vertex hot paths use cached, exactly typed {@link MethodHandle MethodHandles}, avoiding the
+ * argument-array allocation and primitive boxing performed by {@link Method#invoke}.</p>
+ */
 final class ReflectionWorldGeometry {
     private static final AtomicBoolean FAILURE_LOGGED = new AtomicBoolean();
     private static volatile Consumer<String> diagnosticSink = message -> System.err.println("[Aurora] " + message);
     private static volatile String lastError = "";
+
     private static final List<String> RENDER_LAYER_CLASSES = List.of(
             "net.minecraft.client.renderer.RenderType",
             "net.minecraft.client.renderer.rendertype.RenderType",
@@ -42,8 +53,51 @@ final class ReflectionWorldGeometry {
             "net.minecraft.class_1921$class_4688$class_4689"
     );
 
-    private static volatile Object noDepthQuadLayer;
-    private static volatile boolean noDepthQuadLayerAttempted;
+    private static final MethodType OBJECT_TO_OBJECT = MethodType.methodType(Object.class, Object.class);
+    private static final MethodType OBJECT_OBJECT_TO_OBJECT =
+            MethodType.methodType(Object.class, Object.class, Object.class);
+    private static final MethodType OBJECT_OBJECT_TO_VOID =
+            MethodType.methodType(void.class, Object.class, Object.class);
+    private static final MethodType VERTEX_WITH_ENTRY = MethodType.methodType(
+            void.class, Object.class, Object.class, float.class, float.class, float.class);
+    private static final MethodType RAW_VERTEX = MethodType.methodType(
+            void.class, Object.class, float.class, float.class, float.class);
+    private static final MethodType PACKED_COLOR = MethodType.methodType(void.class, Object.class, int.class);
+    private static final MethodType RGBA_COLOR = MethodType.methodType(
+            void.class, Object.class, int.class, int.class, int.class, int.class);
+    private static final MethodType LINE_WIDTH = MethodType.methodType(
+            void.class, Object.class, float.class);
+
+    private static final ClassValue<Resolution<MatrixMethods>> MATRIX_METHODS = new ClassValue<>() {
+        @Override
+        protected Resolution<MatrixMethods> computeValue(Class<?> type) {
+            return Resolution.resolve(() -> MatrixMethods.resolve(type));
+        }
+    };
+    private static final ClassValue<ProviderMethodsHolder> PROVIDER_METHODS = new ClassValue<>() {
+        @Override
+        protected ProviderMethodsHolder computeValue(Class<?> type) {
+            return new ProviderMethodsHolder(type);
+        }
+    };
+    private static final ClassValue<VertexMethodsHolder> VERTEX_METHODS = new ClassValue<>() {
+        @Override
+        protected VertexMethodsHolder computeValue(Class<?> type) {
+            return new VertexMethodsHolder(type);
+        }
+    };
+    private static final ClassValue<Resolution<Class<?>>> RENDER_LAYER_TYPES = new ClassValue<>() {
+        @Override
+        protected Resolution<Class<?>> computeValue(Class<?> matrixType) {
+            return Resolution.resolve(() -> loadAny(matrixType.getClassLoader(), RENDER_LAYER_CLASSES));
+        }
+    };
+    private static final ClassValue<LayerSet> LAYERS = new ClassValue<>() {
+        @Override
+        protected LayerSet computeValue(Class<?> renderLayerType) {
+            return new LayerSet(renderLayerType);
+        }
+    };
 
     private ReflectionWorldGeometry() {
     }
@@ -58,109 +112,107 @@ final class ReflectionWorldGeometry {
 
     static boolean draw(Object matrices, Object providers, CameraPose camera,
                         List<WorldGeometryBatch.Quad> quads, List<WorldGeometryBatch.Line> lines) {
-        if (matrices == null || providers == null || camera == null || !camera.available()) return false;
-        try {
-            Object entry = invokeNoArgs(matrices, List.of("peek", "method_23760", "c"));
-            ClassLoader loader = matrices.getClass().getClassLoader();
-            Class<?> renderLayerClass = loadAny(loader, RENDER_LAYER_CLASSES);
-            Method getBuffer = method(providers.getClass(), List.of("getBuffer", "method_24145", "method_73477"), 1,
-                    candidate -> candidate.getParameterTypes()[0].isAssignableFrom(renderLayerClass));
+        return draw(matrices, providers, camera, quads, lines, List.of());
+    }
 
+    /**
+     * Submits every primitive owned by one {@link WorldGeometryBatch}. Each used layer is flushed
+     * exactly once. When the custom no-depth layer is unavailable, through-wall quads share the
+     * normal quad consumer and flush instead of starting a second identical debug-quad batch.
+     */
+    static boolean draw(Object matrices, Object providers, CameraPose camera,
+                        List<WorldGeometryBatch.Quad> quads, List<WorldGeometryBatch.Line> lines,
+                        List<WorldGeometryBatch.Quad> throughWallQuads) {
+        if (matrices == null || providers == null || camera == null || !camera.available()
+                || camera.eye() == null) {
+            return false;
+        }
+        if (quads.isEmpty() && lines.isEmpty() && throughWallQuads.isEmpty()) {
+            return true;
+        }
+
+        try {
+            Object entry = MATRIX_METHODS.get(matrices.getClass()).value().peek(matrices);
+            Class<?> renderLayerType = RENDER_LAYER_TYPES.get(matrices.getClass()).value();
+            LayerSet layers = LAYERS.get(renderLayerType);
+            ProviderMethods providerMethods = PROVIDER_METHODS.get(providers.getClass()).get(renderLayerType);
+            Vec3 eye = camera.eye();
+
+            Object normalQuadLayer = null;
+            Object throughWallLayer = null;
             if (!quads.isEmpty()) {
-                Object fillLayer = renderLayer(loader, renderLayerClass,
-                        List.of("debugQuads", "method_76023", "w"),
-                        List.of("getDebugQuads", "method_49042", "C"));
-                Object consumer = getBuffer.invoke(providers, fillLayer);
-                VertexMethods vertices = VertexMethods.forConsumer(consumer, entry);
-                for (WorldGeometryBatch.Quad quad : quads) {
-                    vertices.quad(entry, consumer, relative(quad.a(), camera), relative(quad.b(), camera),
-                            relative(quad.c(), camera), relative(quad.d(), camera),
-                            quad.colorA(), quad.colorB(), quad.colorC(), quad.colorD());
+                normalQuadLayer = layers.quads();
+            }
+            if (!throughWallQuads.isEmpty()) {
+                throughWallLayer = layers.noDepthQuads();
+                if (throughWallLayer == null) {
+                    throughWallLayer = normalQuadLayer != null ? normalQuadLayer : layers.quads();
                 }
-                invokeOneArg(providers, List.of("draw", "method_22994", "a"), fillLayer);
+            }
+
+            boolean combineQuads = normalQuadLayer != null && normalQuadLayer == throughWallLayer;
+            if (normalQuadLayer != null) {
+                Object consumer = providerMethods.getBuffer(providers, normalQuadLayer);
+                VertexMethods vertices = VERTEX_METHODS.get(consumer.getClass()).get(entry);
+                vertices.quads(entry, consumer, quads, eye);
+                if (combineQuads) {
+                    vertices.quads(entry, consumer, throughWallQuads, eye);
+                }
+                providerMethods.draw(providers, normalQuadLayer);
+            } else if (throughWallLayer != null && layers.isNormalQuadLayer(throughWallLayer)) {
+                // No regular fills were submitted and no-depth construction failed. Draw the
+                // fallback fill before outlines, matching the usual fill-then-line ordering.
+                Object consumer = providerMethods.getBuffer(providers, throughWallLayer);
+                VERTEX_METHODS.get(consumer.getClass()).get(entry)
+                        .quads(entry, consumer, throughWallQuads, eye);
+                providerMethods.draw(providers, throughWallLayer);
+                combineQuads = true;
             }
 
             if (!lines.isEmpty()) {
-                Object lineLayer = renderLayer(loader, renderLayerClass,
-                        List.of("lines", "method_76015", "r"),
-                        List.of("getLines", "method_23594", "y"));
-                Object consumer = getBuffer.invoke(providers, lineLayer);
-                VertexMethods vertices = VertexMethods.forConsumer(consumer, entry);
-                for (WorldGeometryBatch.Line line : lines) {
-                    vertices.line(entry, consumer, relative(line.from(), camera), relative(line.to(), camera),
-                            line.fromColor(), line.toColor());
-                }
-                invokeOneArg(providers, List.of("draw", "method_22994", "a"), lineLayer);
+                Object lineLayer = layers.lines();
+                Object consumer = providerMethods.getBuffer(providers, lineLayer);
+                VERTEX_METHODS.get(consumer.getClass()).get(entry).lines(entry, consumer, lines, eye);
+                providerMethods.draw(providers, lineLayer);
+            }
+
+            if (throughWallLayer != null && !combineQuads) {
+                Object consumer = providerMethods.getBuffer(providers, throughWallLayer);
+                VERTEX_METHODS.get(consumer.getClass()).get(entry)
+                        .quads(entry, consumer, throughWallQuads, eye);
+                providerMethods.draw(providers, throughWallLayer);
             }
             return true;
-        } catch (ReflectiveOperationException | RuntimeException exception) {
-            lastError = exception.getClass().getSimpleName() + ": " + exception.getMessage();
-            if (FAILURE_LOGGED.compareAndSet(false, true)) {
-                diagnosticSink.accept("3D world renderer failed: " + lastError);
+        } catch (Throwable failure) {
+            if (failure instanceof Error error) {
+                throw error;
             }
+            reportFailure(failure);
             return false;
         }
     }
 
-    /** Draws quads with depth testing disabled, so they stay visible through walls (ESP-style). Falls
-     * back to the normal depth-tested debug-quads layer if the no-depth render layer can't be built
-     * (e.g. an unexpected mapping), so this never renders worse than {@link #draw}. */
+    /**
+     * Compatibility entry point for callers that only have through-wall geometry.
+     */
     static boolean drawThroughWalls(Object matrices, Object providers, CameraPose camera,
                                     List<WorldGeometryBatch.Quad> quads) {
-        if (matrices == null || providers == null || camera == null || !camera.available() || quads.isEmpty()) {
-            return quads.isEmpty();
-        }
-        try {
-            Object entry = invokeNoArgs(matrices, List.of("peek", "method_23760", "c"));
-            ClassLoader loader = matrices.getClass().getClassLoader();
-            Class<?> renderLayerClass = loadAny(loader, RENDER_LAYER_CLASSES);
-            Object noDepthLayer = noDepthQuadLayer(loader);
-            Object layer = noDepthLayer != null ? noDepthLayer
-                    : renderLayer(loader, renderLayerClass,
-                    List.of("debugQuads", "method_76023", "w"),
-                    List.of("getDebugQuads", "method_49042", "C"));
-            Method getBuffer = method(providers.getClass(), List.of("getBuffer", "method_24145", "method_73477"), 1,
-                    candidate -> candidate.getParameterTypes()[0].isInstance(layer));
-            Object consumer = getBuffer.invoke(providers, layer);
-            VertexMethods vertices = VertexMethods.forConsumer(consumer, entry);
-            for (WorldGeometryBatch.Quad quad : quads) {
-                vertices.quad(entry, consumer, relative(quad.a(), camera), relative(quad.b(), camera),
-                        relative(quad.c(), camera), relative(quad.d(), camera),
-                        quad.colorA(), quad.colorB(), quad.colorC(), quad.colorD());
-            }
-            invokeOneArg(providers, List.of("draw", "method_22994", "a"), layer);
+        if (quads.isEmpty()) {
             return true;
-        } catch (ReflectiveOperationException | RuntimeException exception) {
-            lastError = exception.getClass().getSimpleName() + ": " + exception.getMessage();
-            if (FAILURE_LOGGED.compareAndSet(false, true)) {
-                diagnosticSink.accept("3D world renderer failed: " + lastError);
-            }
-            return false;
+        }
+        return draw(matrices, providers, camera, List.of(), List.of(), quads);
+    }
+
+    private static void reportFailure(Throwable failure) {
+        String message = failure.getMessage();
+        lastError = failure.getClass().getSimpleName() + (message == null ? "" : ": " + message);
+        if (FAILURE_LOGGED.compareAndSet(false, true)) {
+            diagnosticSink.accept("3D world renderer failed: " + lastError);
         }
     }
 
-    private static Object noDepthQuadLayer(ClassLoader loader) {
-        if (noDepthQuadLayer != null || noDepthQuadLayerAttempted) {
-            return noDepthQuadLayer;
-        }
-        synchronized (ReflectionWorldGeometry.class) {
-            if (noDepthQuadLayer != null || noDepthQuadLayerAttempted) {
-                return noDepthQuadLayer;
-            }
-            noDepthQuadLayerAttempted = true;
-            try {
-                noDepthQuadLayer = buildNoDepthQuadLayer(loader);
-            } catch (ReflectiveOperationException | RuntimeException exception) {
-                diagnosticSink.accept("ESP through-walls render layer unavailable, falling back to normal depth "
-                        + "test: " + exception.getClass().getSimpleName() + ": " + exception.getMessage());
-            }
-            return noDepthQuadLayer;
-        }
-    }
-
-    /** Builds a custom RenderLayer for solid-color quads with depth testing disabled (GL_ALWAYS), so
-     * geometry submitted through it draws on top of anything already in the frame, including terrain
-     * that would normally occlude it. */
+    /** Builds the 1.21.4-style custom no-depth RenderLayer. 1.21.11 moved custom layers to render
+     * pipelines; that version deliberately falls back to its stock debug-quads layer here. */
     private static Object buildNoDepthQuadLayer(ClassLoader loader) throws ReflectiveOperationException {
         Class<?> renderLayerClass = loadAny(loader, RENDER_LAYER_CLASSES);
         Class<?> renderPhaseClass = loadAny(loader, RENDER_PHASE_CLASSES);
@@ -205,6 +257,7 @@ final class ReflectionWorldGeometry {
             try {
                 return type.getField(name).get(null);
             } catch (NoSuchFieldException ignored) {
+                // Try the next namespace.
             }
         }
         throw new NoSuchFieldException(type.getName() + "." + names);
@@ -221,27 +274,23 @@ final class ReflectionWorldGeometry {
         throw new NoSuchMethodException(type.getName() + "." + names);
     }
 
-    private static Vec3 relative(Vec3 point, CameraPose camera) {
-        return point.subtract(camera.eye());
-    }
-
     private static Class<?> loadAny(ClassLoader loader, List<String> names) throws ClassNotFoundException {
         for (String name : names) {
             try {
                 return Class.forName(name, false, loader);
             } catch (ClassNotFoundException ignored) {
+                // Try the next namespace/version.
             }
         }
-        throw new ClassNotFoundException("Minecraft RenderLayer was not found");
+        throw new ClassNotFoundException("Minecraft class was not found; tried " + names);
     }
 
     private static Object invokeStaticNoArgs(Class<?> type, List<String> names) throws ReflectiveOperationException {
-        Method method = method(type, names, 0, candidate -> Modifier.isStatic(candidate.getModifiers()));
-        return method.invoke(null);
+        Method target = method(type, names, 0, candidate -> Modifier.isStatic(candidate.getModifiers()));
+        return target.invoke(null);
     }
 
-    /** Resolves the 1.21.11 RenderLayers factories first, then the factories that lived directly on
-     * RenderLayer through 1.21.10. Fabric production uses the intermediary names in each list. */
+    /** Resolves 1.21.11's RenderLayers owner first, then the owner used through 1.21.10. */
     private static Object renderLayer(ClassLoader loader, Class<?> legacyOwner, List<String> modernNames,
                                       List<String> legacyNames) throws ReflectiveOperationException {
         try {
@@ -251,68 +300,162 @@ final class ReflectionWorldGeometry {
         }
     }
 
-    private static Object invokeNoArgs(Object target, List<String> names) throws ReflectiveOperationException {
-        Method method = method(target.getClass(), names, 0,
-                candidate -> !Modifier.isStatic(candidate.getModifiers()) && candidate.getReturnType() != boolean.class);
-        return method.invoke(target);
-    }
-
-    private static void invokeOneArg(Object target, List<String> names, Object argument)
-            throws ReflectiveOperationException {
-        Method method = method(target.getClass(), names, 1, candidate ->
-                !Modifier.isStatic(candidate.getModifiers())
-                        && candidate.getParameterTypes()[0].isInstance(argument));
-        method.invoke(target, argument);
-    }
-
     private static Method method(Class<?> type, List<String> names, int parameterCount,
-                                 java.util.function.Predicate<Method> extra) throws NoSuchMethodException {
+                                 Predicate<Method> extra) throws NoSuchMethodException {
         for (Method candidate : type.getMethods()) {
-            if (names.contains(candidate.getName()) && candidate.getParameterCount() == parameterCount && extra.test(candidate)) {
-                candidate.setAccessible(true);
+            if (names.contains(candidate.getName()) && candidate.getParameterCount() == parameterCount
+                    && extra.test(candidate)) {
+                candidate.trySetAccessible();
                 return candidate;
             }
         }
         throw new NoSuchMethodException(type.getName() + "." + names);
     }
 
-    private record VertexMethods(Method vertex, boolean vertexUsesEntry, Method color,
-                                 Method normal, boolean normalUsesEntry) {
-        static VertexMethods forConsumer(Object consumer, Object entry) throws NoSuchMethodException {
-            Class<?> type = consumer.getClass();
+    private static MethodHandle handle(Method method, MethodType targetType) throws IllegalAccessException {
+        MethodHandle handle;
+        try {
+            handle = MethodHandles.publicLookup().unreflect(method);
+        } catch (IllegalAccessException inaccessiblePublicMethod) {
+            if (!method.trySetAccessible()) {
+                throw inaccessiblePublicMethod;
+            }
+            handle = MethodHandles.lookup().unreflect(method);
+        }
+        return handle.asType(targetType);
+    }
+
+    private record MatrixMethods(MethodHandle peek) {
+        static MatrixMethods resolve(Class<?> matrixType) throws ReflectiveOperationException {
+            Method method = method(matrixType, List.of("peek", "method_23760", "c"), 0,
+                    candidate -> !Modifier.isStatic(candidate.getModifiers())
+                            && candidate.getReturnType() != boolean.class);
+            return new MatrixMethods(handle(method, OBJECT_TO_OBJECT));
+        }
+
+        Object peek(Object matrices) throws Throwable {
+            return (Object) peek.invokeExact(matrices);
+        }
+    }
+
+    private record ProviderMethods(MethodHandle getBuffer, MethodHandle draw) {
+        static ProviderMethods resolve(Class<?> providerType, Class<?> renderLayerType)
+                throws ReflectiveOperationException {
+            Method getBuffer = method(providerType,
+                    List.of("getBuffer", "method_24145", "method_73477"), 1, candidate ->
+                            !Modifier.isStatic(candidate.getModifiers())
+                                    && candidate.getReturnType() != void.class
+                                    && candidate.getParameterTypes()[0].isAssignableFrom(renderLayerType));
+            Method draw = method(providerType, List.of("draw", "method_22994", "a"), 1, candidate ->
+                    !Modifier.isStatic(candidate.getModifiers())
+                            && candidate.getReturnType() == void.class
+                            && candidate.getParameterTypes()[0].isAssignableFrom(renderLayerType));
+            return new ProviderMethods(
+                    handle(getBuffer, OBJECT_OBJECT_TO_OBJECT),
+                    handle(draw, OBJECT_OBJECT_TO_VOID));
+        }
+
+        Object getBuffer(Object providers, Object layer) throws Throwable {
+            return (Object) getBuffer.invokeExact(providers, layer);
+        }
+
+        void draw(Object providers, Object layer) throws Throwable {
+            draw.invokeExact(providers, layer);
+        }
+    }
+
+    private static final class ProviderMethodsHolder {
+        private final Class<?> providerType;
+        private volatile Class<?> renderLayerType;
+        private volatile Resolution<ProviderMethods> resolution;
+
+        private ProviderMethodsHolder(Class<?> providerType) {
+            this.providerType = providerType;
+        }
+
+        ProviderMethods get(Class<?> requestedRenderLayerType) throws ReflectiveOperationException {
+            Resolution<ProviderMethods> current = resolution;
+            if (current == null || renderLayerType != requestedRenderLayerType) {
+                synchronized (this) {
+                    current = resolution;
+                    if (current == null || renderLayerType != requestedRenderLayerType) {
+                        current = Resolution.resolve(
+                                () -> ProviderMethods.resolve(providerType, requestedRenderLayerType));
+                        renderLayerType = requestedRenderLayerType;
+                        resolution = current;
+                    }
+                }
+            }
+            return current.value();
+        }
+    }
+
+    private record VertexMethods(MethodHandle vertex, boolean vertexUsesEntry,
+                                 MethodHandle color, boolean colorUsesPackedArgb,
+                                 MethodHandle normal, boolean normalUsesEntry,
+                                 MethodHandle lineWidth) {
+        static VertexMethods resolve(Class<?> consumerType, Object entry) throws ReflectiveOperationException {
             Method vertex;
             boolean vertexUsesEntry;
             try {
-                vertex = method(type, List.of("vertex", "method_56824", "a"), 4, candidate -> {
-                    Class<?>[] p = candidate.getParameterTypes();
-                    return p[0].isInstance(entry) && p[1] == float.class
-                            && p[2] == float.class && p[3] == float.class;
-                });
+                vertex = method(consumerType, List.of("vertex", "addVertex", "method_56824", "a"), 4,
+                        candidate -> entryAndFloats(candidate.getParameterTypes(), entry));
                 vertexUsesEntry = true;
             } catch (NoSuchMethodException ignored) {
-                vertex = method(type, List.of("vertex", "method_22912", "a"), 3,
+                vertex = method(consumerType, List.of("vertex", "addVertex", "method_22912", "a"), 3,
                         candidate -> allFloats(candidate.getParameterTypes()));
                 vertexUsesEntry = false;
             }
-            Method color = method(type, List.of("color", "method_1336", "a"), 4, candidate -> {
-                Class<?>[] p = candidate.getParameterTypes();
-                return p[0] == int.class && p[1] == int.class && p[2] == int.class && p[3] == int.class;
-            });
+
+            Method color;
+            boolean colorUsesPackedArgb;
+            try {
+                // method_39415 is VertexConsumer.color(int) in both supported intermediary maps.
+                color = method(consumerType,
+                        List.of("color", "setColor", "method_39415", "method_1336", "a"), 1,
+                        candidate -> candidate.getParameterTypes()[0] == int.class);
+                colorUsesPackedArgb = true;
+            } catch (NoSuchMethodException ignored) {
+                color = method(consumerType, List.of("color", "setColor", "method_1336", "a"), 4,
+                        candidate -> allInts(candidate.getParameterTypes()));
+                colorUsesPackedArgb = false;
+            }
+
             Method normal;
             boolean normalUsesEntry;
             try {
-                normal = method(type, List.of("normal", "method_60831", "b"), 4, candidate -> {
-                    Class<?>[] p = candidate.getParameterTypes();
-                    return p[0].isInstance(entry) && p[1] == float.class
-                            && p[2] == float.class && p[3] == float.class;
-                });
+                normal = method(consumerType, List.of("normal", "setNormal", "method_60831", "b"), 4,
+                        candidate -> entryAndFloats(candidate.getParameterTypes(), entry));
                 normalUsesEntry = true;
             } catch (NoSuchMethodException ignored) {
-                normal = method(type, List.of("normal", "method_22914", "b"), 3,
+                normal = method(consumerType, List.of("normal", "setNormal", "method_22914", "b"), 3,
                         candidate -> allFloats(candidate.getParameterTypes()));
                 normalUsesEntry = false;
             }
-            return new VertexMethods(vertex, vertexUsesEntry, color, normal, normalUsesEntry);
+
+            MethodHandle lineWidth = null;
+            try {
+                // LINES gained a mandatory LineWidth vertex element in 1.21.11. Older versions do
+                // not expose this method, so its absence must remain a supported configuration.
+                Method method = method(consumerType,
+                        List.of("lineWidth", "method_75298", "a"), 1,
+                        candidate -> candidate.getParameterTypes()[0] == float.class);
+                lineWidth = handle(method, LINE_WIDTH);
+            } catch (NoSuchMethodException ignored) {
+                // Minecraft 1.21.4 line formats only require position, color, and normal.
+            }
+
+            return new VertexMethods(
+                    handle(vertex, vertexUsesEntry ? VERTEX_WITH_ENTRY : RAW_VERTEX), vertexUsesEntry,
+                    handle(color, colorUsesPackedArgb ? PACKED_COLOR : RGBA_COLOR), colorUsesPackedArgb,
+                    handle(normal, normalUsesEntry ? VERTEX_WITH_ENTRY : RAW_VERTEX), normalUsesEntry,
+                    lineWidth);
+        }
+
+        private static boolean entryAndFloats(Class<?>[] parameters, Object entry) {
+            return parameters.length == 4 && parameters[0].isInstance(entry)
+                    && parameters[1] == float.class && parameters[2] == float.class
+                    && parameters[3] == float.class;
         }
 
         private static boolean allFloats(Class<?>[] parameters) {
@@ -320,39 +463,201 @@ final class ReflectionWorldGeometry {
                     && parameters[1] == float.class && parameters[2] == float.class;
         }
 
-        void quad(Object entry, Object consumer, Vec3 a, Vec3 b, Vec3 c, Vec3 d,
-                  int colorA, int colorB, int colorC, int colorD)
-                throws ReflectiveOperationException {
-            vertex(entry, consumer, a, colorA, null);
-            vertex(entry, consumer, b, colorB, null);
-            vertex(entry, consumer, c, colorC, null);
-            vertex(entry, consumer, d, colorD, null);
+        private static boolean allInts(Class<?>[] parameters) {
+            return parameters.length == 4 && parameters[0] == int.class && parameters[1] == int.class
+                    && parameters[2] == int.class && parameters[3] == int.class;
         }
 
-        void line(Object entry, Object consumer, Vec3 from, Vec3 to, int fromColor, int toColor)
-                throws ReflectiveOperationException {
-            Vec3 direction = to.subtract(from).normalize();
-            vertex(entry, consumer, from, fromColor, direction);
-            vertex(entry, consumer, to, toColor, direction);
-        }
-
-        private void vertex(Object entry, Object consumer, Vec3 point, int argb, Vec3 direction)
-                throws ReflectiveOperationException {
-            if (vertexUsesEntry) {
-                vertex.invoke(consumer, entry, (float) point.x(), (float) point.y(), (float) point.z());
-            } else {
-                vertex.invoke(consumer, (float) point.x(), (float) point.y(), (float) point.z());
+        void quads(Object entry, Object consumer, List<WorldGeometryBatch.Quad> quads, Vec3 eye)
+                throws Throwable {
+            double eyeX = eye.x();
+            double eyeY = eye.y();
+            double eyeZ = eye.z();
+            for (int index = 0, size = quads.size(); index < size; index++) {
+                WorldGeometryBatch.Quad quad = quads.get(index);
+                vertex(entry, consumer, quad.a(), quad.colorA(), eyeX, eyeY, eyeZ, false, 0, 0, 0);
+                vertex(entry, consumer, quad.b(), quad.colorB(), eyeX, eyeY, eyeZ, false, 0, 0, 0);
+                vertex(entry, consumer, quad.c(), quad.colorC(), eyeX, eyeY, eyeZ, false, 0, 0, 0);
+                vertex(entry, consumer, quad.d(), quad.colorD(), eyeX, eyeY, eyeZ, false, 0, 0, 0);
             }
-            color.invoke(consumer, (argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF, (argb >>> 24) & 0xFF);
-            if (direction != null) {
-                if (normalUsesEntry) {
-                    normal.invoke(consumer, entry, (float) direction.x(), (float) direction.y(),
-                            (float) direction.z());
+        }
+
+        void lines(Object entry, Object consumer, List<WorldGeometryBatch.Line> lines, Vec3 eye)
+                throws Throwable {
+            double eyeX = eye.x();
+            double eyeY = eye.y();
+            double eyeZ = eye.z();
+            for (int index = 0, size = lines.size(); index < size; index++) {
+                WorldGeometryBatch.Line line = lines.get(index);
+                Vec3 from = line.from();
+                Vec3 to = line.to();
+                double normalX = to.x() - from.x();
+                double normalY = to.y() - from.y();
+                double normalZ = to.z() - from.z();
+                double lengthSquared = normalX * normalX + normalY * normalY + normalZ * normalZ;
+                if (lengthSquared > 1.0e-18D) {
+                    double inverseLength = 1.0D / Math.sqrt(lengthSquared);
+                    normalX *= inverseLength;
+                    normalY *= inverseLength;
+                    normalZ *= inverseLength;
                 } else {
-                    normal.invoke(consumer, (float) direction.x(), (float) direction.y(),
-                            (float) direction.z());
+                    normalX = 0.0D;
+                    normalY = 0.0D;
+                    normalZ = 0.0D;
+                }
+                vertex(entry, consumer, from, line.fromColor(), eyeX, eyeY, eyeZ,
+                        true, normalX, normalY, normalZ);
+                vertex(entry, consumer, to, line.toColor(), eyeX, eyeY, eyeZ,
+                        true, normalX, normalY, normalZ);
+            }
+        }
+
+        private void vertex(Object entry, Object consumer, Vec3 point, int argb,
+                            double eyeX, double eyeY, double eyeZ, boolean writeNormal,
+                            double normalX, double normalY, double normalZ) throws Throwable {
+            float x = (float) (point.x() - eyeX);
+            float y = (float) (point.y() - eyeY);
+            float z = (float) (point.z() - eyeZ);
+            if (vertexUsesEntry) {
+                vertex.invokeExact(consumer, entry, x, y, z);
+            } else {
+                vertex.invokeExact(consumer, x, y, z);
+            }
+            if (colorUsesPackedArgb) {
+                color.invokeExact(consumer, argb);
+            } else {
+                color.invokeExact(consumer, (argb >> 16) & 0xFF, (argb >> 8) & 0xFF,
+                        argb & 0xFF, (argb >>> 24) & 0xFF);
+            }
+            if (writeNormal) {
+                float nx = (float) normalX;
+                float ny = (float) normalY;
+                float nz = (float) normalZ;
+                if (normalUsesEntry) {
+                    normal.invokeExact(consumer, entry, nx, ny, nz);
+                } else {
+                    normal.invokeExact(consumer, nx, ny, nz);
+                }
+                if (lineWidth != null) {
+                    lineWidth.invokeExact(consumer, 1.0F);
                 }
             }
+        }
+    }
+
+    private static final class VertexMethodsHolder {
+        private final Class<?> consumerType;
+        private volatile Class<?> entryType;
+        private volatile Resolution<VertexMethods> resolution;
+
+        private VertexMethodsHolder(Class<?> consumerType) {
+            this.consumerType = consumerType;
+        }
+
+        VertexMethods get(Object entry) throws ReflectiveOperationException {
+            Class<?> requestedEntryType = entry.getClass();
+            Resolution<VertexMethods> current = resolution;
+            if (current == null || entryType != requestedEntryType) {
+                synchronized (this) {
+                    current = resolution;
+                    if (current == null || entryType != requestedEntryType) {
+                        current = Resolution.resolve(() -> VertexMethods.resolve(consumerType, entry));
+                        entryType = requestedEntryType;
+                        resolution = current;
+                    }
+                }
+            }
+            return current.value();
+        }
+    }
+
+    private static final class LayerSet {
+        private final Class<?> renderLayerType;
+        private final ClassLoader loader;
+        private volatile Resolution<Object> quads;
+        private volatile Resolution<Object> lines;
+        private volatile Resolution<Object> noDepthQuads;
+
+        private LayerSet(Class<?> renderLayerType) {
+            this.renderLayerType = renderLayerType;
+            this.loader = renderLayerType.getClassLoader();
+        }
+
+        Object quads() throws ReflectiveOperationException {
+            Resolution<Object> current = quads;
+            if (current == null) {
+                synchronized (this) {
+                    current = quads;
+                    if (current == null) {
+                        current = Resolution.resolve(() -> renderLayer(loader, renderLayerType,
+                                List.of("debugQuads", "method_76023", "w"),
+                                List.of("getDebugQuads", "method_49042", "C")));
+                        quads = current;
+                    }
+                }
+            }
+            return current.value();
+        }
+
+        Object lines() throws ReflectiveOperationException {
+            Resolution<Object> current = lines;
+            if (current == null) {
+                synchronized (this) {
+                    current = lines;
+                    if (current == null) {
+                        current = Resolution.resolve(() -> renderLayer(loader, renderLayerType,
+                                List.of("lines", "method_76015", "r"),
+                                List.of("getLines", "method_23594", "y")));
+                        lines = current;
+                    }
+                }
+            }
+            return current.value();
+        }
+
+        Object noDepthQuads() {
+            Resolution<Object> current = noDepthQuads;
+            if (current == null) {
+                synchronized (this) {
+                    current = noDepthQuads;
+                    if (current == null) {
+                        current = Resolution.resolve(() -> buildNoDepthQuadLayer(loader));
+                        noDepthQuads = current;
+                        if (current.failure() != null) {
+                            Throwable failure = current.failure();
+                            diagnosticSink.accept("ESP through-walls render layer unavailable, falling back to normal "
+                                    + "depth test: " + failure.getClass().getSimpleName() + ": " + failure.getMessage());
+                        }
+                    }
+                }
+            }
+            return current.failure() == null ? current.uncheckedValue() : null;
+        }
+
+        boolean isNormalQuadLayer(Object layer) throws ReflectiveOperationException {
+            return layer == quads();
+        }
+    }
+
+    @FunctionalInterface
+    private interface Resolver<T> {
+        T resolve() throws ReflectiveOperationException;
+    }
+
+    private record Resolution<T>(T uncheckedValue, ReflectiveOperationException failure) {
+        static <T> Resolution<T> resolve(Resolver<T> resolver) {
+            try {
+                return new Resolution<>(resolver.resolve(), null);
+            } catch (ReflectiveOperationException failure) {
+                return new Resolution<>(null, failure);
+            }
+        }
+
+        T value() throws ReflectiveOperationException {
+            if (failure != null) {
+                throw failure;
+            }
+            return uncheckedValue;
         }
     }
 }

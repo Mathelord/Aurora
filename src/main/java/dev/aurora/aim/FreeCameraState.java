@@ -88,6 +88,20 @@ public final class FreeCameraState {
         return new AimAngles(bodyYaw, bodyPitch).clampedPitch();
     }
 
+    /**
+     * Updates the body direction restored after a camera pass without changing the detached view.
+     * This lets a non-decoupled aim controller continue to steer the player while Free Look owns
+     * only the camera direction.
+     */
+    public synchronized void updateBodyAngles(AimAngles angles) {
+        if (!active || angles == null) {
+            return;
+        }
+        AimAngles body = angles.clampedPitch();
+        bodyYaw = body.yaw();
+        bodyPitch = body.pitch();
+    }
+
     /** Whether the player's body should be prevented from moving (Freecam only). */
     public synchronized boolean freezeMovement() {
         return active && positionDetached;

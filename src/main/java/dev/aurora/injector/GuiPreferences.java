@@ -14,10 +14,25 @@ final class GuiPreferences {
     private static final String ACCENT_KEY = "appearance.accent";
     private static final String RAINBOW_KEY = "appearance.rainbowModules";
     private static final String SILENT_AIM_INDICATOR_KEY = "silentAim.crosshairIndicator";
+    private static final String NOTIFICATION_RADIUS_KEY = "notifications.radius";
+    private static final String NOTIFICATIONS_ENABLED_KEY = "notifications.enabled";
+    private static final String NOTIFICATION_BLUR_KEY = "notifications.blur";
+    private static final String NOTIFICATION_OPACITY_KEY = "notifications.opacity";
+    private static final String NOTIFICATION_DURATION_KEY = "notifications.durationMillis";
     private static final String FRIENDS_KEY = "friends.list";
+    private static final String ACTIVE_PROFILE_KEY = "profiles.active";
     private static final Preferences PREFERENCES = Preferences.userNodeForPackage(ControlPanelGui.class);
 
     private GuiPreferences() {
+    }
+
+    /** The last profile the user applied, or an empty string when none is active. */
+    static String activeProfile() {
+        return PREFERENCES.get(ACTIVE_PROFILE_KEY, "");
+    }
+
+    static void setActiveProfile(String name) {
+        PREFERENCES.put(ACTIVE_PROFILE_KEY, name == null ? "" : name);
     }
 
     /** The friended player names, in the order they were added. */
@@ -56,6 +71,46 @@ final class GuiPreferences {
         PREFERENCES.putBoolean(SILENT_AIM_INDICATOR_KEY, enabled);
     }
 
+    static int notificationRadius() {
+        return Math.max(8, Math.min(28, PREFERENCES.getInt(NOTIFICATION_RADIUS_KEY, 18)));
+    }
+
+    static boolean notificationsEnabled() {
+        return PREFERENCES.getBoolean(NOTIFICATIONS_ENABLED_KEY, true);
+    }
+
+    static void setNotificationsEnabled(boolean enabled) {
+        PREFERENCES.putBoolean(NOTIFICATIONS_ENABLED_KEY, enabled);
+    }
+
+    static void setNotificationRadius(int radius) {
+        PREFERENCES.putInt(NOTIFICATION_RADIUS_KEY, Math.max(8, Math.min(28, radius)));
+    }
+
+    static int notificationBlur() {
+        return Math.max(4, Math.min(40, PREFERENCES.getInt(NOTIFICATION_BLUR_KEY, 4)));
+    }
+
+    static void setNotificationBlur(int blur) {
+        PREFERENCES.putInt(NOTIFICATION_BLUR_KEY, Math.max(4, Math.min(40, blur)));
+    }
+
+    static int notificationOpacity() {
+        return Math.max(0, Math.min(100, PREFERENCES.getInt(NOTIFICATION_OPACITY_KEY, 35)));
+    }
+
+    static void setNotificationOpacity(int opacity) {
+        PREFERENCES.putInt(NOTIFICATION_OPACITY_KEY, Math.max(0, Math.min(100, opacity)));
+    }
+
+    static int notificationDurationMillis() {
+        return Math.max(500, Math.min(5_000, PREFERENCES.getInt(NOTIFICATION_DURATION_KEY, 1_500)));
+    }
+
+    static void setNotificationDurationMillis(int durationMillis) {
+        PREFERENCES.putInt(NOTIFICATION_DURATION_KEY, Math.max(500, Math.min(5_000, durationMillis)));
+    }
+
     static Color accentColor() {
         try {
             return parseColor(PREFERENCES.get(ACCENT_KEY, formatColor(DEFAULT_ACCENT)));
@@ -86,4 +141,5 @@ final class GuiPreferences {
     static String formatColor(Color color) {
         return String.format(Locale.ROOT, "#%02X%02X%02X", color.getRed(), color.getGreen(), color.getBlue());
     }
+
 }

@@ -23,23 +23,30 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.LongSupplier;
 
 /** Eclipse-style anchor sequence: acquire a placement, aim, place, optionally cover, charge and detonate. */
 public final class AutoAnchorModule extends AbstractModule {
     private static final String AIM_OWNER = "auto-anchor";
     private static final double REACH = 4.7D;
+    private static final double AUTOMATIC_RANGE = 12.0D;
     private static final double AIM_THRESHOLD = 8.0D;
     private static final int AIM_TIMEOUT_TICKS = 12;
+    private static final long HOLD_ACTIVATION_NANOS = 500_000_000L;
+    private static final List<HorizontalOffset> COVER_OFFSETS = List.of(
+            new HorizontalOffset(-1, -1), new HorizontalOffset(0, -1), new HorizontalOffset(1, -1),
+            new HorizontalOffset(-1, 0), new HorizontalOffset(1, 0),
+            new HorizontalOffset(-1, 1), new HorizontalOffset(0, 1), new HorizontalOffset(1, 1));
 
     private enum Phase { IDLE, AIM_ANCHOR, WAIT_ANCHOR, AIM_COVER, WAIT_COVER,
         AIM_CHARGE, WAIT_CHARGE, AIM_DETONATE, WAIT_DETONATION }
 
     private final MinecraftBridge minecraft;
+    private final LongSupplier nanoTime;
     private final ModuleSetting mustBeBound;
     private final ModuleSetting safeAnchor;
     private final ModuleSetting decoupledAim;
     private final ModuleSetting aimSpeed;
-    private final ModuleSetting autoRange;
     private final ModuleSetting autoCooldown;
     private final ModuleSetting restoreSlot;
 
@@ -48,16 +55,24 @@ public final class AutoAnchorModule extends AbstractModule {
     private BlockHitTarget coverPlacementHit;
     private BlockPos anchorPos;
     private BlockPos coverPos;
+    private BlockPos failedAnchorPos;
     private Vec3 aimTarget;
     private int aimTicks;
     private int waitTicks;
     private int cooldownTicks;
     private int previousSlot = -1;
+    private long boundKeyDownSince = -1L;
+    private boolean sustainedHold;
 
     public AutoAnchorModule(MinecraftBridge minecraft) {
+        this(minecraft, System::nanoTime);
+    }
+
+    AutoAnchorModule(MinecraftBridge minecraft, LongSupplier nanoTime) {
         super("auto-anchor", "Auto Anchor", "Combat",
                 "Automatically aims, places, charges, and detonates respawn anchors near players.");
         this.minecraft = Objects.requireNonNull(minecraft, "minecraft");
+        this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         mustBeBound = booleanSetting("must-be-bound", "Must Be Bound", false)
                 .description("Runs one crosshair-selected combo and disables. Off continuously targets nearby players.");
         safeAnchor = booleanSetting("safe-anchor", "Safe Anchor", true)
@@ -65,14 +80,17 @@ public final class AutoAnchorModule extends AbstractModule {
         decoupledAim = booleanSetting("decoupled-aim", "Decoupled Aim", true)
                 .description("Rotates the server-facing player while keeping the visible camera independent.");
         aimSpeed = setting("aim-speed", "Aim Speed", 1.0D, 0.1D, 5.0D, 0.05D);
-        autoRange = setting("auto-range", "Auto Range", 6.0D, 1.0D, 12.0D, 0.1D);
-        autoCooldown = setting("auto-cooldown-ticks", "Auto Cooldown", 8.0D, 0.0D, 60.0D, 1.0D);
+        autoCooldown = setting("auto-cooldown-ticks", "Auto Cooldown", 8.0D, 0.0D, 60.0D, 1.0D)
+                .visibleWhen(() -> !on(mustBeBound));
         restoreSlot = booleanSetting("restore-slot", "Restore Slot", true);
     }
 
     @Override public void onEnable() {
+        failedAnchorPos = null;
         resetSequence();
         previousSlot = minecraft.selectedHotbarSlot();
+        boundKeyDownSince = boundKeyHeld() ? nanoTime.getAsLong() : -1L;
+        sustainedHold = false;
         if (on(mustBeBound)) startBoundSequence();
     }
 
@@ -80,10 +98,13 @@ public final class AutoAnchorModule extends AbstractModule {
         SilentAimSystem.get().clearOwner(AIM_OWNER);
         restorePreviousSlot();
         resetSequence();
+        boundKeyDownSince = -1L;
+        sustainedHold = false;
+        failedAnchorPos = null;
     }
 
     @Override public void onRender(RenderEvent event) {
-        if (aimTarget == null || phase == Phase.IDLE) {
+        if (aimTarget == null || (phase == Phase.IDLE && on(mustBeBound))) {
             SilentAimSystem.get().clearOwner(AIM_OWNER);
             return;
         }
@@ -104,8 +125,19 @@ public final class AutoAnchorModule extends AbstractModule {
 
     @Override public void onTick(TickEvent event) {
         if (!minecraft.isInGame() || minecraft.hasOpenScreen()) return;
+        if (on(mustBeBound)) {
+            updateBoundHoldState();
+            if (sustainedHold && !boundKeyHeld()) {
+                setEnabled(false);
+                return;
+            }
+        }
         if (phase == Phase.IDLE) {
-            if (on(mustBeBound)) return;
+            if (on(mustBeBound)) {
+                if (sustainedHold) startBoundSequence();
+                else if (!boundKeyHeld()) setEnabled(false);
+                return;
+            }
             if (cooldownTicks > 0) cooldownTicks--;
             else startAutomaticSequence();
             return;
@@ -128,18 +160,29 @@ public final class AutoAnchorModule extends AbstractModule {
         Optional<BlockHitTarget> hit = minecraft.crosshairBlock();
         if (hit.isEmpty()) { finishAttempt(); return; }
         BlockHitTarget support = hit.get();
-        BlockPos pos = offset(support, support.face());
+        BlockPos pos;
+        if (minecraft.isBlockReplaceableAt(support.blockX(), support.blockY(), support.blockZ())) {
+            pos = new BlockPos(support.blockX(), support.blockY(), support.blockZ());
+            support = new BlockHitTarget(pos.x(), pos.y() - 1, pos.z(), BlockFace.UP,
+                    new Vec3(pos.x() + 0.5D, pos.y(), pos.z() + 0.5D));
+        } else {
+            pos = offset(support, support.face());
+        }
         if (!canPlace(pos)) { finishAttempt(); return; }
         begin(pos, support);
     }
 
     private void startAutomaticSequence() {
         if (!hasItems()) { cooldownTicks = cooldown(); return; }
-        AimContext context = minecraft.aimContext(autoRange.value(), false);
+        AimContext context = minecraft.aimContext(AUTOMATIC_RANGE, false);
         AimTarget target = !context.available() ? null : context.targets().stream()
                 .min(Comparator.comparingDouble(AimTarget::distanceSquared)).orElse(null);
         Candidate candidate = target == null ? null : findCandidate(target);
-        if (candidate == null) { cooldownTicks = Math.max(1, cooldown()); return; }
+        if (candidate == null) {
+            failedAnchorPos = null;
+            cooldownTicks = Math.max(1, cooldown());
+            return;
+        }
         begin(candidate.pos(), candidate.hit());
     }
 
@@ -154,6 +197,7 @@ public final class AutoAnchorModule extends AbstractModule {
         for (int y = cy - 1; y <= cy + 1; y++) for (int x = cx - 2; x <= cx + 2; x++) for (int z = cz - 2; z <= cz + 2; z++) {
             BlockPos pos = new BlockPos(x, y, z);
             BlockPos support = new BlockPos(x, y - 1, z);
+            if (pos.equals(failedAnchorPos)) continue;
             if (!canPlace(pos) || !minecraft.isBlockSolidAt(support.x(), support.y(), support.z())) continue;
             Vec3 top = placementAimPoint(x, y, z, point);
             if (distance(minecraft.playerEyePosition(), top) > REACH) continue;
@@ -199,9 +243,21 @@ public final class AutoAnchorModule extends AbstractModule {
     }
 
     private void waitAnchor() {
-        if (block(anchorPos) == BlockType.RESPAWN_ANCHOR) { beginCoverOrCharge(); return; }
+        if (block(anchorPos) == BlockType.RESPAWN_ANCHOR) {
+            failedAnchorPos = null;
+            beginCoverOrCharge();
+            return;
+        }
         confirmPlacement(ItemType.RESPAWN_ANCHOR, anchorPlacementHit);
-        if (++waitTicks > 8) finishAttempt();
+        if (++waitTicks >= 6) {
+            if (!on(mustBeBound)) {
+                failedAnchorPos = anchorPos;
+                resetSequence();
+                startAutomaticSequence();
+            } else {
+                finishAttempt();
+            }
+        }
     }
 
     private void beginCoverOrCharge() {
@@ -217,17 +273,23 @@ public final class AutoAnchorModule extends AbstractModule {
     private Candidate findCover() {
         if (!on(safeAnchor) || minecraft.hotbarItemCount(ItemType.GLOWSTONE) < 2) return null;
         Vec3 player = minecraft.playerPosition();
-        return List.of(BlockFace.NORTH, BlockFace.SOUTH, BlockFace.WEST, BlockFace.EAST).stream()
-                .sorted(Comparator.comparingDouble(face -> -face.offsetX() * (player.x() - anchorPos.x() - 0.5D)
-                        - face.offsetZ() * (player.z() - anchorPos.z() - 0.5D)))
-                .map(face -> {
-                    BlockPos pos = new BlockPos(anchorPos.x() + face.offsetX(), anchorPos.y(), anchorPos.z() + face.offsetZ());
+        double playerOffsetX = player.x() - anchorPos.x() - 0.5D;
+        double playerOffsetZ = player.z() - anchorPos.z() - 0.5D;
+        return COVER_OFFSETS.stream()
+                .sorted(Comparator.comparingDouble(offset -> coverDirectionScore(
+                        playerOffsetX, playerOffsetZ, offset.x(), offset.z())))
+                .map(offset -> {
+                    BlockPos pos = new BlockPos(anchorPos.x() + offset.x(), anchorPos.y(), anchorPos.z() + offset.z());
                     BlockPos support = new BlockPos(pos.x(), pos.y() - 1, pos.z());
                     Vec3 hit = new Vec3(pos.x() + 0.5D, pos.y(), pos.z() + 0.5D);
                     return canPlace(pos) && minecraft.isBlockSolidAt(support.x(), support.y(), support.z())
                             && distance(minecraft.playerEyePosition(), hit) <= REACH
                             ? new Candidate(pos, new BlockHitTarget(support.x(), support.y(), support.z(), BlockFace.UP, hit)) : null;
                 }).filter(Objects::nonNull).findFirst().orElse(null);
+    }
+
+    static double coverDirectionScore(double playerOffsetX, double playerOffsetZ, int x, int z) {
+        return -(x * playerOffsetX + z * playerOffsetZ) / Math.hypot(x, z);
     }
 
     private void waitCover() {
@@ -303,7 +365,7 @@ public final class AutoAnchorModule extends AbstractModule {
     }
 
     private boolean canPlace(BlockPos pos) {
-        return block(pos) == BlockType.AIR && !minecraft.hasEntityCollision(
+        return minecraft.isBlockReplaceableAt(pos.x(), pos.y(), pos.z()) && !minecraft.hasEntityCollision(
                 new Vec3(pos.x(), pos.y(), pos.z()), new Vec3(pos.x() + 1, pos.y() + 1, pos.z() + 1));
     }
 
@@ -315,10 +377,16 @@ public final class AutoAnchorModule extends AbstractModule {
         Optional<BlockHitTarget> actual = minecraft.crosshairBlock();
         if (expected == null || actual.isEmpty()) return false;
         BlockHitTarget hit = actual.get();
-        return hit.blockX() == expected.blockX()
+        boolean expectedBlock = hit.blockX() == expected.blockX()
                 && hit.blockY() == expected.blockY()
-                && hit.blockZ() == expected.blockZ()
-                && (!requireFace || hit.face() == expected.face());
+                && hit.blockZ() == expected.blockZ();
+        BlockPos placementPos = offset(expected, expected.face());
+        boolean replaceableBlock = requireFace
+                && hit.blockX() == placementPos.x()
+                && hit.blockY() == placementPos.y()
+                && hit.blockZ() == placementPos.z()
+                && minecraft.isBlockReplaceableAt(placementPos.x(), placementPos.y(), placementPos.z());
+        return (expectedBlock || replaceableBlock) && (!requireFace || hit.face() == expected.face());
     }
 
     private boolean isAimed() {
@@ -330,11 +398,28 @@ public final class AutoAnchorModule extends AbstractModule {
     }
 
     private void finishAttempt() {
-        SilentAimSystem.get().clearOwner(AIM_OWNER);
+        boolean automatic = !on(mustBeBound);
+        Vec3 retainedAimTarget = automatic ? aimTarget : null;
+        if (!automatic) SilentAimSystem.get().clearOwner(AIM_OWNER);
         restorePreviousSlot();
         resetSequence();
-        if (on(mustBeBound)) { if (enabled()) setEnabled(false); }
+        if (automatic) aimTarget = retainedAimTarget;
+        if (on(mustBeBound)) {
+            updateBoundHoldState();
+            if (!boundKeyHeld() && enabled()) setEnabled(false);
+        }
         else cooldownTicks = Math.max(1, cooldown());
+    }
+
+    private boolean boundKeyHeld() {
+        return keybind() >= 0 && minecraft.isKeyDown(keybind());
+    }
+
+    private void updateBoundHoldState() {
+        if (!boundKeyHeld()) return;
+        long now = nanoTime.getAsLong();
+        if (boundKeyDownSince < 0L) boundKeyDownSince = now;
+        if (now - boundKeyDownSince >= HOLD_ACTIVATION_NANOS) sustainedHold = true;
     }
 
     private void restorePreviousSlot() {
@@ -347,6 +432,13 @@ public final class AutoAnchorModule extends AbstractModule {
     }
 
     private BlockHitTarget anchorHit() {
+        Optional<BlockHitTarget> crosshair = minecraft.crosshairBlock();
+        if (crosshair.isPresent()) {
+            BlockHitTarget hit = crosshair.get();
+            if (hit.blockX() == anchorPos.x() && hit.blockY() == anchorPos.y() && hit.blockZ() == anchorPos.z()) {
+                return hit;
+            }
+        }
         return new BlockHitTarget(anchorPos.x(), anchorPos.y(), anchorPos.z(), BlockFace.UP,
                 new Vec3(anchorPos.x() + 0.5D, anchorPos.y() + 0.92D, anchorPos.z() + 0.5D));
     }
@@ -390,4 +482,5 @@ public final class AutoAnchorModule extends AbstractModule {
     }
     private record BlockPos(int x, int y, int z) { }
     private record Candidate(BlockPos pos, BlockHitTarget hit) { }
+    private record HorizontalOffset(int x, int z) { }
 }

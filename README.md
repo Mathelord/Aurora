@@ -12,7 +12,7 @@
 > If u want a module/feature open an issue
 > Other Minecraft versions are rejected by the launcher.
 
-Aurora is a Minecraft 1.21.4 fabric injection client with a external gui.
+Aurora is a Minecraft 1.21.4 fabric Java Agent injection client with a external gui.
 
 Make sure to check out [Mathelord/Eclipse](https://github.com/Mathelord/Eclipse).
 
@@ -29,29 +29,50 @@ If you find bugs for 1.21.11 open an issue
 
 ## Modules
 
-- Reach
-- BackTrack
-- Auto Anchor
+### Combat
+
 - Aim Assist
-- Silent Aura
-- Target Ring
-- Trigger Bot
-- Jump Reset
-- Knockback Delay
-- No Jump Delay
+- Auto Anchor
 - Hit Swap
-- Trail
-- Trajectories
-- ESP
-- Tracers
-- Fullbright
-- Free Look
-- Freecam
+- Silent Aura
+- Trigger Bot
+
+### Movement
+
+- Instant Stop
+- Jump Reset
+- No Jump Delay
+
+### Player
+
 - AutoTool
 - FastPlace
-- Network Delay
+- Reach
+
+### Network
+
+- BackTrack
 - Blink
+- Knockback Delay
+- Network Delay (if set to 2000ms i had a 29~ block reach)
+
+### Render
+
+- Anti Debuff
+- ESP
+- Free Look
+- Freecam
+- Fullbright
+- Nametags
+- Target Ring
 - Text GUI
+- Trail
+- Tracers
+- Trajectories
+
+### Misc
+
+- Panic
 
 ## Configuration
 
@@ -65,3 +86,7 @@ the operating system and how Minecraft was launched:
 | Windows | `%APPDATA%\Aurora\config.properties` |
 | Flatpak launcher | `~/.var/app/<launcher-app-id>/config/aurora/config.properties` |
 | Prismlauncher Flatpak | `~/.var/app/org.prismlauncher.PrismLauncher/config/aurora/config.properties` |
+
+## Profiles
+
+- does what it does

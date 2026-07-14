@@ -6,6 +6,7 @@ import dev.aurora.aim.DecoupledAimState;
 import dev.aurora.aim.DecoupledMovementSteering;
 import dev.aurora.aim.AimMath;
 import dev.aurora.social.FriendManager;
+import dev.aurora.render.OpenGlHudEffects;
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.StubMethod;
@@ -36,6 +37,13 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     private static final double CHIN_EYE_HEIGHT_RATIO = 0.82D;
     // Renderers only need a plausible projection, not the player's exact configured slider value.
     private static final double DEFAULT_FOV_DEGREES = 70.0D;
+    private volatile ProjectionSnapshot nametagProjection;
+    private static final long RENDER_QUERY_CACHE_NANOS = 2_000_000L;
+    private static final long NAMETAG_FALLBACK_CACHE_NANOS = 50_000_000L;
+    private static final int MAX_TEXT_WIDTH_CACHE_SIZE = 4_096;
+    private volatile AimContextCache aimContextCache;
+    private volatile FriendTargetsCache friendTargetsCache;
+    private volatile NametagTargetsCache nametagTargetsCache;
     private static final List<String> CLIENT_CLASSES = List.of(
             "net.minecraft.client.Minecraft",
             "net.minecraft.client.MinecraftClient",
@@ -122,11 +130,20 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     private static final List<String> FORWARD_KEY_FIELD_NAMES = List.of(
             "keyUp", "forwardKey", "keyForward", "field_1894", "w", "f_92070_"
     );
+    private static final List<String> BACKWARD_KEY_FIELD_NAMES = List.of("keyDown", "backKey", "backwardKey", "field_1881", "s", "f_92071_");
+    private static final List<String> LEFT_KEY_FIELD_NAMES = List.of("keyLeft", "leftKey", "field_1913", "a", "f_92072_");
+    private static final List<String> RIGHT_KEY_FIELD_NAMES = List.of("keyRight", "rightKey", "field_1849", "d", "f_92073_");
     // Entity#xo/yo/zo (last-tick position, used to interpolate render-space poses), in Mojmap and
     // 1.21.4 intermediary.
     private static final List<String> PREV_X_FIELD_NAMES = List.of("xo", "field_6014");
     private static final List<String> PREV_Y_FIELD_NAMES = List.of("yo", "field_6036");
     private static final List<String> PREV_Z_FIELD_NAMES = List.of("zo", "field_5969");
+    // Entity#tickCount / age in Mojmap, Yarn, intermediary, 1.21.4 official and 1.21.11 official.
+    // Using this marker keeps the comparatively expensive nametag entity scan at game tick rate,
+    // including when the client is paused or the server is lagging.
+    private static final List<String> ENTITY_TICK_FIELD_NAMES = List.of(
+            "tickCount", "age", "field_6012", "af", "at"
+    );
     // DeltaTracker#getGameTimeDeltaPartialTick(boolean), in Mojmap and 1.21.4 intermediary.
     private static final List<String> GAME_TIME_DELTA_METHOD_NAMES = List.of(
             "getGameTimeDeltaPartialTick", "method_60637"
@@ -145,6 +162,13 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     private final Map<Object, Double> originalReachValues = Collections.synchronizedMap(new IdentityHashMap<>());
     private final Map<String, Object> aimTargetEntities = Collections.synchronizedMap(new java.util.HashMap<>());
     private final Map<Class<?>, Method> fillMethodCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<Class<?>, TextDrawMethod> textDrawMethodCache = new ConcurrentHashMap<>();
+    private final Map<String, Integer> textWidthCache = new ConcurrentHashMap<>();
+    private final OpenGlHudEffects hudEffects;
+    private volatile Object cachedMinecraftClient;
+    private volatile HudTextAccess hudTextAccess;
+    private volatile Object currentHudContext;
+    private volatile HudSize currentHudSize = HudSize.unavailable();
     private volatile Object clickGuiScreen;
     private volatile Object previousScreen;
 
@@ -155,6 +179,8 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     private static final Map<Class<?>, Map<String, Method>> NO_ARG_METHOD_CACHE =
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final Map<Class<?>, Map<String, Field>> FIELD_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Map<Class<?>, GuiMatrixAccess> GUI_MATRIX_ACCESS_CACHE =
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final Method ABSENT_METHOD;
     private static final Field ABSENT_FIELD;
@@ -224,6 +250,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
 
     public ReflectionMinecraftBridge(Consumer<String> diagnosticSink) {
         this.diagnosticSink = diagnosticSink == null ? ignored -> { } : diagnosticSink;
+        this.hudEffects = new OpenGlHudEffects(this.diagnosticSink);
     }
 
     @Override
@@ -290,7 +317,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean applyReach(double range) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return false;
             }
@@ -320,9 +347,15 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
 
     @Override
     public AimContext aimContext(double range, boolean ignoreWalls) {
+        long now = System.nanoTime();
+        AimContextCache cached = aimContextCache;
+        if (cached != null && cached.range() == range && cached.ignoreWalls() == ignoreWalls
+                && now - cached.createdAtNanos() <= RENDER_QUERY_CACHE_NANOS) {
+            return cached.context();
+        }
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             Object world = readField(client, "world", "level", "field_1687", "r", "f_91073_").orElse(null);
             if (player == null || world == null) {
                 return AimContext.unavailable();
@@ -379,7 +412,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
                 aimTargetEntities.putAll(resolvedEntities);
             }
 
-            return new AimContext(
+            AimContext result = new AimContext(
                     true,
                     screenOpen(client),
                     yaw,
@@ -387,6 +420,8 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
                     mouseSensitivity(client),
                     targets
             );
+            aimContextCache = new AimContextCache(now, range, ignoreWalls, result);
+            return result;
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("aim-context", exception);
             return AimContext.unavailable();
@@ -395,9 +430,15 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
 
     @Override
     public List<AimTarget> friendTargets(double range) {
+        long now = System.nanoTime();
+        FriendTargetsCache cached = friendTargetsCache;
+        if (cached != null && cached.range() == range
+                && now - cached.createdAtNanos() <= RENDER_QUERY_CACHE_NANOS) {
+            return cached.targets();
+        }
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             Object world = readField(client, "world", "level", "field_1687", "r", "f_91073_").orElse(null);
             if (player == null || world == null) {
                 return List.of();
@@ -439,11 +480,115 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
                         health(candidate)
                 ));
             }
-            return friends;
+            List<AimTarget> result = List.copyOf(friends);
+            friendTargetsCache = new FriendTargetsCache(now, range, result);
+            return result;
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("friend-targets", exception);
             return List.of();
         }
+    }
+
+    @Override
+    public List<NametagTarget> nametagTargets(double range) {
+        long now = System.nanoTime();
+        try {
+            Object client = minecraftClientFast().orElseThrow();
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
+            Object world = readField(client, "world", "level", "field_1687", "r", "f_91073_").orElse(null);
+            if (player == null || world == null || !Double.isFinite(range) || range < 0.0D) {
+                nametagTargetsCache = null;
+                return List.of();
+            }
+
+            long tickMarker = entityTick(player).orElse(Long.MIN_VALUE);
+            NametagTargetsCache snapshot = nametagTargetsCache;
+            if (shouldRefreshNametagTargets(snapshot, world, tickMarker, now)) {
+                snapshot = captureNametagTargets(client, world, player, tickMarker, now);
+                nametagTargetsCache = snapshot;
+            }
+            return interpolateNametagTargets(snapshot, range, partialTick());
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            reportOnce("nametag-targets", exception);
+            return List.of();
+        }
+    }
+
+    private static boolean shouldRefreshNametagTargets(NametagTargetsCache snapshot, Object world,
+                                                       long tickMarker, long now) {
+        if (snapshot == null || snapshot.world() != world) {
+            return true;
+        }
+        if (tickMarker != Long.MIN_VALUE) {
+            return snapshot.tickMarker() != tickMarker;
+        }
+        return now - snapshot.createdAtNanos() >= NAMETAG_FALLBACK_CACHE_NANOS;
+    }
+
+    private static NametagTargetsCache captureNametagTargets(Object client, Object world, Object player,
+                                                              long tickMarker, long now)
+            throws ReflectiveOperationException {
+        Vec3 currentOrigin = position(player).orElseThrow();
+        Vec3 previousOrigin = previousPosition(player, currentOrigin);
+        List<NametagEntitySnapshot> snapshots = new ArrayList<>();
+        for (Object entity : renderableEntities(world)) {
+            if (entity == null || !isUsableTarget(entity)) {
+                continue;
+            }
+            Vec3 currentPosition = position(entity).orElse(null);
+            if (currentPosition == null) {
+                continue;
+            }
+            NametagTarget.Kind kind = nametagKind(entity);
+            String name = targetName(entity);
+            Object info = kind == NametagTarget.Kind.PLAYER ? playerInfo(client, entity) : null;
+            double entityHealth = kind == NametagTarget.Kind.ITEM ? 0.0D : health(entity);
+            double maximumHealth = kind == NametagTarget.Kind.ITEM ? 0.0D : getNumberCompatible(entity,
+                    List.of("getMaxHealth", "method_6063", "m_21233_")).orElse(0.0D);
+            double tagHeight = kind == NametagTarget.Kind.ITEM
+                    ? height(entity) + 0.2D
+                    : eyeHeight(entity) + 0.5D;
+            snapshots.add(new NametagEntitySnapshot(
+                    targetId(entity),
+                    name,
+                    kind,
+                    previousPosition(entity, currentPosition),
+                    currentPosition,
+                    tagHeight,
+                    entityHealth,
+                    maximumHealth,
+                    playerPing(info),
+                    playerGameMode(info),
+                    kind == NametagTarget.Kind.ITEM ? itemCount(entity) : 0,
+                    kind == NametagTarget.Kind.PLAYER && FriendManager.get().isFriend(name),
+                    entity == player
+            ));
+        }
+        return new NametagTargetsCache(now, tickMarker, world, previousOrigin, currentOrigin,
+                List.copyOf(snapshots));
+    }
+
+    private static List<NametagTarget> interpolateNametagTargets(NametagTargetsCache snapshot,
+                                                                 double range, float tickDelta) {
+        if (snapshot == null || snapshot.entities().isEmpty()) {
+            return List.of();
+        }
+        Vec3 origin = interpolate(snapshot.previousOrigin(), snapshot.currentOrigin(), tickDelta);
+        double maximumSquared = range * range;
+        List<NametagTarget> targets = new ArrayList<>(snapshot.entities().size());
+        for (NametagEntitySnapshot entity : snapshot.entities()) {
+            Vec3 entityPosition = interpolate(entity.previousPosition(), entity.currentPosition(), tickDelta);
+            double distanceSquared = entityPosition.squaredDistanceTo(origin);
+            if (distanceSquared > maximumSquared) {
+                continue;
+            }
+            targets.add(new NametagTarget(
+                    entity.id(), entity.name(), entity.kind(), entityPosition, entity.height(),
+                    Math.sqrt(distanceSquared), entity.health(), entity.maxHealth(), entity.ping(),
+                    entity.gameMode(), entity.itemCount(), entity.friend(), entity.localPlayer()
+            ));
+        }
+        return List.copyOf(targets);
     }
 
     @Override
@@ -454,7 +599,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             if (client == null) {
                 return List.of();
             }
-            Object localPlayer = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object localPlayer = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             String localName = localPlayer == null ? null : targetName(localPlayer);
             // Prefer the server tab list (all online players, even out of render distance).
             Object handler = invokeNoArgs(client, "getNetworkHandler", "getConnection", "method_1562")
@@ -503,7 +648,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean applyAimRotation(double yaw, double pitch) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return false;
             }
@@ -726,7 +871,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public void suppressClickGuiGameplayInput() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
             if (options == null) {
                 return;
             }
@@ -786,7 +931,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         }
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return entity == player;
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("local-player", exception);
@@ -881,7 +1026,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             return false;
         }
         try {
-            return setBooleanField(camera, List.of("detached", "thirdPerson", "field_18719"), detached);
+            return setBooleanField(camera, List.of("detached", "thirdPerson", "field_18719", "p"), detached);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("camera-detached", exception);
             return false;
@@ -895,7 +1040,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             if (options == null) {
                 return -1;
             }
-            Object perspective = invokeNoArgs(options, "getCameraType", "getPerspective", "method_31044")
+            Object perspective = invokeNoArgs(options, "getCameraType", "getPerspective", "method_31044", "aV")
                     .orElse(null);
             return perspective instanceof Enum<?> value ? value.ordinal() : -1;
         } catch (RuntimeException exception) {
@@ -914,7 +1059,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             if (options == null) {
                 return false;
             }
-            Object current = invokeNoArgs(options, "getCameraType", "getPerspective", "method_31044")
+            Object current = invokeNoArgs(options, "getCameraType", "getPerspective", "method_31044", "aV")
                     .orElse(null);
             if (!(current instanceof Enum<?> value)) {
                 return false;
@@ -924,7 +1069,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
                 return false;
             }
             return invokeOneCompatible(options,
-                    List.of("setCameraType", "setPerspective", "method_31043"), constants[ordinal]);
+                    List.of("setCameraType", "setPerspective", "method_31043", "a"), constants[ordinal]);
         } catch (RuntimeException exception) {
             reportOnce("camera-perspective-set", exception);
             return false;
@@ -937,7 +1082,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             if (client == null) {
                 return Optional.empty();
             }
-            return readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_");
+            return readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_");
         } catch (ReflectiveOperationException | RuntimeException exception) {
             return Optional.empty();
         }
@@ -953,8 +1098,8 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         // tick's rotation. Set the previous fields too so the third-person camera offset and the view
         // matrix land exactly on the requested angle instead of a blend with the real body angle.
         try {
-            setNumberField(entity, List.of("prevYaw", "yRotO", "field_5982", "f_19859_"), yaw);
-            setNumberField(entity, List.of("prevPitch", "xRotO", "field_6004", "f_19860_"), pitch);
+            setNumberField(entity, List.of("prevYaw", "lastYaw", "yRotO", "field_5982", "ab", "f_19859_"), yaw);
+            setNumberField(entity, List.of("prevPitch", "lastPitch", "xRotO", "field_6004", "ac", "f_19860_"), pitch);
         } catch (ReflectiveOperationException | RuntimeException ignored) {
             // Previous-rotation fields are a best-effort refinement; current rotation already applied.
         }
@@ -968,11 +1113,11 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         }
         try {
             boolean yawApplied = invokeVoidNumberCompatible(entity,
-                    List.of("setYaw", "setYRot", "method_36456", "m_146922_"), yaw)
-                    || setNumberField(entity, List.of("yaw", "yRot", "field_6031", "f_19857_"), yaw);
+                    List.of("setYaw", "setYRot", "method_36456", "v", "m_146922_"), yaw)
+                    || setNumberField(entity, List.of("yaw", "yRot", "field_6031", "aZ", "f_19857_"), yaw);
             boolean pitchApplied = invokeVoidNumberCompatible(entity,
-                    List.of("setPitch", "setXRot", "method_36457", "m_146926_"), pitch)
-                    || setNumberField(entity, List.of("pitch", "xRot", "field_5965", "f_19858_"), pitch);
+                    List.of("setPitch", "setXRot", "method_36457", "w", "m_146926_"), pitch)
+                    || setNumberField(entity, List.of("pitch", "xRot", "field_5965", "ba", "f_19858_"), pitch);
             return yawApplied || pitchApplied;
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("entity-rotation", exception);
@@ -988,7 +1133,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         try {
             Object target = aimTargetEntities.get(targetId);
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             Object interactionManager = readField(client, "interactionManager", "gameMode", "field_1761", "s", "f_91072_").orElse(null);
             if (target == null || player == null || interactionManager == null) {
                 return false;
@@ -1149,6 +1294,29 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     }
 
     @Override
+    public boolean isBlockReplaceableAt(int x, int y, int z) {
+        try {
+            Object client = minecraftClient().orElseThrow();
+            Object world = readField(client, "world", "level", "field_1687", "r", "f_91073_").orElse(null);
+            if (world == null) {
+                return false;
+            }
+            Object state = invokeCompatible(world, List.of("getBlockState", "method_8320", "m_8055_"),
+                    newBlockPos(x, y, z)).orElse(null);
+            if (state == null) {
+                return false;
+            }
+            // BlockState#isReplaceable / BlockBehaviour.BlockStateBase#canBeReplaced.
+            // This includes air, fire, fluids, plants and replaceable snow layers.
+            return invokeBooleanNoArgs(state,
+                    List.of("isReplaceable", "canBeReplaced", "method_45474", "m_280296_")).orElse(false);
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            reportOnce("block-replaceable", exception);
+            return false;
+        }
+    }
+
+    @Override
     public boolean hasEntityCollision(Vec3 min, Vec3 max) {
         if (min == null || max == null) {
             return false;
@@ -1237,7 +1405,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         }
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             Object world = readField(client, "world", "level", "field_1687", "r", "f_91073_").orElse(null);
             Object expectedItem = resolveItem(item).orElse(null);
             if (player == null || world == null || expectedItem == null) {
@@ -1593,7 +1761,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public double attackCooldown() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player == null ? 0.0D : invokeNumberCompatible(player,
                     List.of("getAttackCooldownProgress", "getAttackStrengthScale", "method_7261", "m_36403_"), 0.0F).orElse(0.0D);
         } catch (ReflectiveOperationException | RuntimeException exception) {
@@ -1622,7 +1790,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean isUsingItem() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player != null && invokeBooleanNoArgs(player,
                     List.of("isUsingItem", "isUsingItem", "method_6115", "m_6117_")).orElse(false);
         } catch (ReflectiveOperationException | RuntimeException exception) {
@@ -1707,7 +1875,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean swingMainHand() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return false;
             }
@@ -1723,7 +1891,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean stopUsingItem() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             Object interactionManager = readField(client, "interactionManager", "gameMode", "field_1761", "s", "f_91072_").orElse(null);
             return player != null && interactionManager != null && invokeOneCompatible(interactionManager,
                     List.of("stopUsingItem", "releaseUsingItem", "method_2897", "m_105251_"), player);
@@ -1753,7 +1921,30 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     }
 
     @Override
+    public boolean drawFrostedPanel(Object renderContext, int left, int top, int right, int bottom,
+                                    int radius, float blurRadius, int tintColor, int borderColor) {
+        if (renderContext == null) return false;
+        return hudEffects.drawFrostedPanel(hudSize(renderContext), left, top, right, bottom,
+                radius, blurRadius, tintColor, borderColor);
+    }
+
+    @Override
+    public void beginHudFrame(Object renderContext) {
+        hudEffects.beginFrame();
+        currentHudContext = renderContext;
+        currentHudSize = resolveHudSize(renderContext);
+        refreshHudTextAccess();
+    }
+
+    @Override
     public HudSize hudSize(Object renderContext) {
+        if (renderContext != null && renderContext == currentHudContext) {
+            return currentHudSize;
+        }
+        return resolveHudSize(renderContext);
+    }
+
+    private static HudSize resolveHudSize(Object renderContext) {
         if (renderContext == null) {
             return HudSize.unavailable();
         }
@@ -1781,7 +1972,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         double length = Math.hypot(dx, dy);
         if (length <= 0.001D) return false;
         Object matrices = invokeNoArgs(renderContext, "getMatrices", "pose", "method_51448", "c", "e").orElse(null);
-        if (matrices == null || !invokeMatrixNoArgs(matrices, "push", "pushPose", "pushMatrix", "method_22903", "a")) return false;
+        if (matrices == null || !pushGuiMatrix(matrices)) return false;
         try {
             if (!translateGuiMatrix(matrices, startX, startY)
                     || !rotateGuiMatrix(matrices, Math.atan2(dy, dx))) return false;
@@ -1792,40 +1983,112 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             fill(renderContext, 0, -1, width, 2, 0x96000000);
             return fill(renderContext, 0, 0, width, 1, color);
         } finally {
-            invokeMatrixNoArgs(matrices, "pop", "popPose", "popMatrix", "method_22909", "b");
+            popGuiMatrix(matrices);
         }
     }
 
-    private static boolean invokeMatrixNoArgs(Object target, String... names) {
-        for (Method method : target.getClass().getMethods()) {
-            if (List.of(names).contains(method.getName()) && method.getParameterCount() == 0) {
-                try {
-                    method.invoke(target);
-                    return true;
-                } catch (ReflectiveOperationException ignored) {
-                }
-            }
+    private static boolean pushGuiMatrix(Object matrices) {
+        return invokeGuiMatrixMethod(matrices, guiMatrixAccess(matrices.getClass()).push());
+    }
+
+    private static boolean popGuiMatrix(Object matrices) {
+        return invokeGuiMatrixMethod(matrices, guiMatrixAccess(matrices.getClass()).pop());
+    }
+
+    private static boolean invokeGuiMatrixMethod(Object matrices, Method method) {
+        if (method == null) {
+            return false;
         }
-        return false;
+        try {
+            method.invoke(matrices);
+            return true;
+        } catch (ReflectiveOperationException ignored) {
+            return false;
+        }
     }
 
     private static boolean translateGuiMatrix(Object matrices, double x, double y) {
-        for (Method method : matrices.getClass().getMethods()) {
-            if (!List.of("translate", "method_22904", "method_46416", "a").contains(method.getName())) continue;
+        Method method = guiMatrixAccess(matrices.getClass()).translate();
+        if (method == null) {
+            return false;
+        }
+        Class<?>[] types = method.getParameterTypes();
+        try {
+            if (types.length == 2) {
+                method.invoke(matrices, floatingValue(types[0], x), floatingValue(types[1], y));
+            } else {
+                method.invoke(matrices, floatingValue(types[0], x), floatingValue(types[1], y),
+                        floatingValue(types[2], 0.0D));
+            }
+            return true;
+        } catch (ReflectiveOperationException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean scaleGuiMatrix(Object matrices, double scale) {
+        Method method = guiMatrixAccess(matrices.getClass()).scale();
+        if (method == null) {
+            return false;
+        }
+        Class<?>[] types = method.getParameterTypes();
+        try {
+            if (types.length == 2) {
+                method.invoke(matrices, floatingValue(types[0], scale), floatingValue(types[1], scale));
+            } else {
+                method.invoke(matrices, floatingValue(types[0], scale), floatingValue(types[1], scale),
+                        floatingValue(types[2], 1.0D));
+            }
+            return true;
+        } catch (ReflectiveOperationException ignored) {
+            return false;
+        }
+    }
+
+    private static GuiMatrixAccess guiMatrixAccess(Class<?> matrixClass) {
+        return GUI_MATRIX_ACCESS_CACHE.computeIfAbsent(matrixClass, ReflectionMinecraftBridge::resolveGuiMatrixAccess);
+    }
+
+    private static GuiMatrixAccess resolveGuiMatrixAccess(Class<?> matrixClass) {
+        Method push = null;
+        Method pop = null;
+        Method translate = null;
+        Method scale = null;
+        for (Method method : matrixClass.getMethods()) {
+            String name = method.getName();
             Class<?>[] types = method.getParameterTypes();
-            try {
-                if (types.length == 2 && floating(types[0]) && floating(types[1])) {
-                    method.invoke(matrices, floatingValue(types[0], x), floatingValue(types[1], y));
-                    return true;
+            if (types.length == 0) {
+                if (push == null && List.of("push", "pushPose", "pushMatrix", "method_22903", "a").contains(name)) {
+                    push = method;
+                } else if (pop == null && List.of("pop", "popPose", "popMatrix", "method_22909", "b").contains(name)) {
+                    pop = method;
                 }
-                if (types.length == 3 && floating(types[0]) && floating(types[1]) && floating(types[2])) {
-                    method.invoke(matrices, floatingValue(types[0], x), floatingValue(types[1], y), floatingValue(types[2], 0.0D));
-                    return true;
-                }
-            } catch (ReflectiveOperationException ignored) {
+            } else if (translate == null
+                    && List.of("translate", "method_22904", "method_46416", "a").contains(name)
+                    && floatingParameters(types)) {
+                translate = method;
+            } else if (scale == null && List.of("scale", "method_22905", "a").contains(name)
+                    && floatingParameters(types)) {
+                scale = method;
             }
         }
-        return false;
+        if (push != null) push.setAccessible(true);
+        if (pop != null) pop.setAccessible(true);
+        if (translate != null) translate.setAccessible(true);
+        if (scale != null) scale.setAccessible(true);
+        return new GuiMatrixAccess(push, pop, translate, scale);
+    }
+
+    private static boolean floatingParameters(Class<?>[] types) {
+        if (types.length != 2 && types.length != 3) {
+            return false;
+        }
+        for (Class<?> type : types) {
+            if (!floating(type)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static boolean rotateGuiMatrix(Object matrices, double radians) {
@@ -1888,28 +2151,87 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         if (renderContext == null || text == null) {
             return false;
         }
-        try {
-            Object client = minecraftClient().orElseThrow();
-            Object textRenderer = readField(client, "font", "textRenderer", "field_1772", "h", "f_91062_").orElseThrow();
-            for (Method method : renderContext.getClass().getMethods()) {
-                Class<?>[] parameters = method.getParameterTypes();
-                if (parameters.length == 5 && parameters[0].isInstance(textRenderer)
-                        && parameters[1] == String.class && parameters[2] == int.class
-                        && parameters[3] == int.class && parameters[4] == int.class) {
-                    method.invoke(renderContext, textRenderer, text, x, y, color);
-                    return true;
-                }
-                if (parameters.length == 6 && parameters[0].isInstance(textRenderer)
-                        && parameters[1] == String.class && parameters[2] == int.class
-                        && parameters[3] == int.class && parameters[4] == int.class
-                        && parameters[5] == boolean.class) {
-                    method.invoke(renderContext, textRenderer, text, x, y, color, true);
-                    return true;
-                }
-            }
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        HudTextAccess access = hudTextAccess();
+        if (access == null) return false;
+        TextDrawMethod draw = textDrawMethod(renderContext.getClass(), access.renderer());
+        return draw != null && invokeTextDraw(draw, renderContext, access.renderer(), text, x, y, color);
+    }
+
+    private TextDrawMethod textDrawMethod(Class<?> contextClass, Object textRenderer) {
+        TextDrawMethod cached = textDrawMethodCache.get(contextClass);
+        if (cached != null) {
+            return cached;
         }
-        return false;
+        TextDrawMethod resolved = resolveTextDrawMethod(contextClass, textRenderer);
+        if (resolved != null) {
+            textDrawMethodCache.put(contextClass, resolved);
+        }
+        return resolved;
+    }
+
+    private static boolean invokeTextDraw(TextDrawMethod draw, Object renderContext, Object textRenderer,
+                                          String text, int x, int y, int color) {
+        try {
+            if (draw.shadowArgument()) {
+                draw.method().invoke(renderContext, textRenderer, text, x, y, color, true);
+            } else {
+                draw.method().invoke(renderContext, textRenderer, text, x, y, color);
+            }
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static TextDrawMethod resolveTextDrawMethod(Class<?> contextClass, Object textRenderer) {
+        for (Method method : contextClass.getMethods()) {
+            Class<?>[] p = method.getParameterTypes();
+            boolean common = p.length >= 5 && p[0].isInstance(textRenderer) && p[1] == String.class
+                    && p[2] == int.class && p[3] == int.class && p[4] == int.class;
+            if (common && (p.length == 5 || (p.length == 6 && p[5] == boolean.class))) {
+                method.setAccessible(true);
+                return new TextDrawMethod(method, p.length == 6);
+            }
+        }
+        return null;
+    }
+
+    private record TextDrawMethod(Method method, boolean shadowArgument) {}
+
+    @Override
+    public boolean drawScaledText(Object renderContext, String text, int x, int y, double scale, int color) {
+        return drawScaledTextBatch(renderContext, List.of(new TextRun(text, 0, color)), x, y, scale);
+    }
+
+    @Override
+    public boolean drawScaledTextBatch(Object renderContext, List<TextRun> runs,
+                                       double x, double y, double scale) {
+        if (renderContext == null || runs == null || runs.isEmpty()
+                || !Double.isFinite(scale) || scale <= 0.0D) {
+            return false;
+        }
+        Object matrices = invokeNoArgs(renderContext, "getMatrices", "pose", "method_51448", "c", "e").orElse(null);
+        if (matrices == null || !pushGuiMatrix(matrices)) {
+            return MinecraftBridge.super.drawScaledTextBatch(renderContext, runs, x, y, scale);
+        }
+        try {
+            if (!translateGuiMatrix(matrices, x, y) || !scaleGuiMatrix(matrices, scale)) {
+                return false;
+            }
+            HudTextAccess access = hudTextAccess();
+            if (access == null) return false;
+            TextDrawMethod draw = textDrawMethod(renderContext.getClass(), access.renderer());
+            if (draw == null) return false;
+            boolean rendered = true;
+            for (TextRun run : runs) {
+                if (run == null || run.text() == null || run.text().isEmpty()) continue;
+                rendered &= invokeTextDraw(draw, renderContext, access.renderer(), run.text(),
+                        run.xOffset(), 0, run.color());
+            }
+            return rendered;
+        } finally {
+            popGuiMatrix(matrices);
+        }
     }
 
     @Override
@@ -1917,21 +2239,75 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         if (text == null || text.isEmpty()) {
             return 0;
         }
+        Integer cached = textWidthCache.get(text);
+        if (cached != null) {
+            return cached;
+        }
+        HudTextAccess access = hudTextAccess();
+        if (access == null || access.widthMethod() == null) {
+            return 0;
+        }
         try {
-            Object client = minecraftClient().orElseThrow();
-            Object textRenderer = readField(client, "font", "textRenderer", "field_1772", "h", "f_91062_").orElseThrow();
-            Optional<Object> width = invokeCompatible(textRenderer, List.of("getWidth", "width", "method_1727", "m_92895_"), text);
-            return width.filter(Number.class::isInstance).map(value -> ((Number) value).intValue()).orElse(0);
+            Object result = access.widthMethod().invoke(access.renderer(), text);
+            int width = result instanceof Number number ? Math.max(0, number.intValue()) : 0;
+            if (textWidthCache.size() >= MAX_TEXT_WIDTH_CACHE_SIZE) {
+                textWidthCache.clear();
+            }
+            textWidthCache.put(text, width);
+            return width;
         } catch (ReflectiveOperationException | RuntimeException ignored) {
             return 0;
         }
+    }
+
+    private HudTextAccess hudTextAccess() {
+        HudTextAccess access = hudTextAccess;
+        if (access != null) {
+            return access;
+        }
+        refreshHudTextAccess();
+        return hudTextAccess;
+    }
+
+    private void refreshHudTextAccess() {
+        try {
+            Object client = minecraftClientFast().orElse(null);
+            Object renderer = client == null ? null : readField(client,
+                    "font", "textRenderer", "field_1772", "h", "g", "f_91062_").orElse(null);
+            if (renderer == null) {
+                return;
+            }
+            HudTextAccess current = hudTextAccess;
+            if (current != null && current.renderer() == renderer) {
+                return;
+            }
+            Method widthMethod = resolveTextWidthMethod(renderer.getClass());
+            hudTextAccess = new HudTextAccess(renderer, widthMethod);
+            textDrawMethodCache.clear();
+            textWidthCache.clear();
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+    }
+
+    private static Method resolveTextWidthMethod(Class<?> rendererClass) {
+        for (String name : List.of("getWidth", "width", "method_1727", "m_92895_", "b")) {
+            for (Method method : rendererClass.getMethods()) {
+                if (method.getName().equals(name) && method.getParameterCount() == 1
+                        && method.getParameterTypes()[0] == String.class
+                        && isNumericType(method.getReturnType())) {
+                    method.setAccessible(true);
+                    return method;
+                }
+            }
+        }
+        return null;
     }
 
     @Override
     public Optional<AimTarget> crosshairEntity(double range) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return Optional.empty();
             }
@@ -2041,7 +2417,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean isOnGround() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player != null && invokeBooleanNoArgs(player, List.of("isOnGround", "onGround", "method_24828")).orElse(false);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("on-ground", exception);
@@ -2053,7 +2429,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean isSprinting() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player != null && invokeBooleanNoArgs(player, List.of("isSprinting", "method_5624")).orElse(false);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("sprinting", exception);
@@ -2065,7 +2441,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean setSprinting(boolean sprinting) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player != null && invokeBooleanSetter(player,
                     List.of("setSprinting", "method_5728", "m_6858_"), sprinting);
         } catch (ReflectiveOperationException | RuntimeException exception) {
@@ -2078,7 +2454,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public CombatState combatState() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) return CombatState.unavailable();
             Vec3 velocity = velocity(player);
             return new CombatState(
@@ -2102,7 +2478,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public Vec3 playerVelocity() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player == null ? Vec3.ZERO : velocity(player);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             return Vec3.ZERO;
@@ -2113,7 +2489,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean setForwardKeyHeld(boolean held) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
             Object key = options == null ? null : readField(options, FORWARD_KEY_FIELD_NAMES.toArray(String[]::new)).orElse(null);
             return key != null && invokeBooleanSetter(key, KEY_PRESSED_METHOD_NAMES, held);
         } catch (ReflectiveOperationException | RuntimeException exception) {
@@ -2122,11 +2498,24 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         }
     }
 
+    @Override public boolean setBackwardKeyHeld(boolean held) { return setDirectionalKey(BACKWARD_KEY_FIELD_NAMES, held, "backward-key"); }
+    @Override public boolean setLeftKeyHeld(boolean held) { return setDirectionalKey(LEFT_KEY_FIELD_NAMES, held, "left-key"); }
+    @Override public boolean setRightKeyHeld(boolean held) { return setDirectionalKey(RIGHT_KEY_FIELD_NAMES, held, "right-key"); }
+
+    private boolean setDirectionalKey(List<String> names, boolean held, String diagnostic) {
+        try {
+            Object client = minecraftClient().orElseThrow();
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
+            Object key = options == null ? null : readField(options, names.toArray(String[]::new)).orElse(null);
+            return key != null && invokeBooleanSetter(key, KEY_PRESSED_METHOD_NAMES, held);
+        } catch (ReflectiveOperationException | RuntimeException exception) { reportOnce(diagnostic, exception); return false; }
+    }
+
     @Override
     public boolean isForwardKeyPhysicallyDown() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
             Object key = options == null ? null : readField(options, FORWARD_KEY_FIELD_NAMES.toArray(String[]::new)).orElse(null);
             return key != null && invokeBooleanNoArgs(key,
                     List.of("isDown", "isPressed", "method_1434", "m_90857_")).orElse(false);
@@ -2139,7 +2528,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean setJumpKeyHeld(boolean held) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
             return options != null && setJumpKeyHeld(options, held);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("jump-key", exception);
@@ -2156,7 +2545,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean setUseKeyHeld(boolean held) {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
             return options != null && setUseKeyHeld(options, held);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("use-key", exception);
@@ -2173,7 +2562,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public int localEntityId() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return -1;
             }
@@ -2188,7 +2577,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public Vec3 playerPosition() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return Vec3.ZERO;
             }
@@ -2203,7 +2592,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public Vec3 playerEyePosition() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return Vec3.ZERO;
             }
@@ -2219,7 +2608,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public boolean clearJumpCooldown() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             return player != null && clearJumpCooldownField(player);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             reportOnce("jump-cooldown", exception);
@@ -2293,7 +2682,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             return Optional.empty();
         }
         try {
-            Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+            Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
             if (options == null) {
                 return Optional.empty();
             }
@@ -2535,7 +2924,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
     public CameraPose cameraPose() {
         try {
             Object client = minecraftClient().orElseThrow();
-            Object player = readField(client, "player", "field_1724", "t", "f_91074_").orElse(null);
+            Object player = readField(client, "player", "field_1724", "s", "t", "f_91074_").orElse(null);
             if (player == null) {
                 return CameraPose.unavailable();
             }
@@ -2567,6 +2956,112 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             return CameraPose.unavailable();
         }
     }
+
+    @Override
+    public void captureWorldProjection(Object matrixStack) {
+        if (matrixStack == null) return;
+        try {
+            ClassLoader loader = matrixStack.getClass().getClassLoader();
+            Class<?> renderSystem = Class.forName("com.mojang.blaze3d.systems.RenderSystem", true, loader);
+            // Meteor's NametagUtils receives GameRenderer's modelViewMatrix, not the PoseStack
+            // passed into WorldRenderer. At this point RenderSystem's model-view stack contains
+            // that same active camera matrix. The WorldRenderer stack is entity/block-pass local
+            // and is commonly identity here, which projects every entity onto the crosshair.
+            Object model = null;
+            for (Method method : renderSystem.getMethods()) {
+                if (List.of("getModelViewStack").contains(method.getName())
+                        && Modifier.isStatic(method.getModifiers()) && method.getParameterCount() == 0) {
+                    model = method.invoke(null);
+                    break;
+                }
+            }
+            if (matrixValues(model) == null) {
+                Object entry = invokeNoArgs(matrixStack, "peek", "last", "method_23760", "c").orElse(null);
+                model = entry == null ? matrixStack : invokeNoArgs(entry,
+                        "getPositionMatrix", "pose", "method_23761", "a").orElse(null);
+            }
+            Object projection = null;
+            for (Method method : renderSystem.getMethods()) {
+                if (List.of("getProjectionMatrix", "getProjection").contains(method.getName())
+                        && Modifier.isStatic(method.getModifiers()) && method.getParameterCount() == 0) {
+                    projection = method.invoke(null);
+                    break;
+                }
+            }
+            double[] modelValues = matrixValues(model);
+            double[] projectionValues = matrixValues(projection);
+            if (modelValues != null && projectionValues != null) {
+                nametagProjection = new ProjectionSnapshot(modelValues, projectionValues, cameraPose().eye());
+            }
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            reportOnce("nametag-projection-capture", exception);
+        }
+    }
+
+    @Override
+    public ScreenPosition projectToScreen(Object renderContext, Vec3 worldPosition) {
+        ProjectionSnapshot snapshot = nametagProjection;
+        HudSize size = hudSize(renderContext);
+        if (snapshot == null || worldPosition == null || !size.available()) return ScreenPosition.invisible();
+        Vec3 relative = worldPosition.subtract(snapshot.camera());
+        double[] model = transform(snapshot.model(), relative.x(), relative.y(), relative.z(), 1.0D);
+        double[] clip = transform(snapshot.projection(), model[0], model[1], model[2], model[3]);
+        if (!Double.isFinite(clip[3]) || clip[3] <= 0.0D) return ScreenPosition.invisible();
+        double ndcX = clip[0] / clip[3];
+        double ndcY = clip[1] / clip[3];
+        double x = (ndcX * 0.5D + 0.5D) * size.width();
+        double y = (0.5D - ndcY * 0.5D) * size.height();
+        if (!Double.isFinite(x) || !Double.isFinite(y)) return ScreenPosition.invisible();
+        return new ScreenPosition(true, x, y, clip[2] / clip[3]);
+    }
+
+    private static double[] matrixValues(Object matrix) {
+        if (matrix == null) return null;
+        double[] values = new double[16];
+        for (int column = 0; column < 4; column++) {
+            for (int row = 0; row < 4; row++) {
+                String name = "m" + column + row;
+                try {
+                    Method getter = matrix.getClass().getMethod(name);
+                    Object value = getter.invoke(matrix);
+                    if (!(value instanceof Number number)) return null;
+                    values[column * 4 + row] = number.doubleValue();
+                } catch (ReflectiveOperationException exception) {
+                    return null;
+                }
+            }
+        }
+        return values;
+    }
+
+    private static double[] transform(double[] matrix, double x, double y, double z, double w) {
+        return new double[]{
+                matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12] * w,
+                matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13] * w,
+                matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14] * w,
+                matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15] * w
+        };
+    }
+
+    private record ProjectionSnapshot(double[] model, double[] projection, Vec3 camera) {
+    }
+
+    private record AimContextCache(long createdAtNanos, double range, boolean ignoreWalls, AimContext context) {}
+
+    private record FriendTargetsCache(long createdAtNanos, double range, List<AimTarget> targets) {}
+
+    private record NametagEntitySnapshot(String id, String name, NametagTarget.Kind kind,
+                                         Vec3 previousPosition, Vec3 currentPosition, double height,
+                                         double health, double maxHealth, int ping, String gameMode,
+                                         int itemCount, boolean friend, boolean localPlayer) {}
+
+    private record NametagTargetsCache(long createdAtNanos, long tickMarker, Object world,
+                                       Vec3 previousOrigin, Vec3 currentOrigin,
+                                       List<NametagEntitySnapshot> entities) {}
+
+    private record GuiMatrixAccess(Method push, Method pop, Method translate, Method scale) {}
+
+    private record HudTextAccess(Object renderer, Method widthMethod) {}
 
     /** Builds a pose from {@code gameRenderer.getCamera()}, or {@code null} if the camera or any of its
      * position/rotation accessors can't be resolved (in which case the caller falls back to the
@@ -2682,7 +3177,7 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
         if (client == null) {
             return Optional.empty();
         }
-        return readField(client, "player", "field_1724", "t", "f_91074_");
+        return readField(client, "player", "field_1724", "s", "t", "f_91074_");
     }
 
     private static Object playerInventory(Object player) throws ReflectiveOperationException {
@@ -2970,12 +3465,93 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
                 .orElse(List.of());
     }
 
+    private static Iterable<?> renderableEntities(Object world) {
+        Object entities = invokeNoArgs(world, "entitiesForRendering", "getEntities", "method_18112", "f")
+                .orElse(null);
+        if (entities instanceof Iterable<?> iterable) return iterable;
+        try {
+            return players(world);
+        } catch (IllegalAccessException ignored) {
+            return List.of();
+        }
+    }
+
+    private static NametagTarget.Kind nametagKind(Object entity) {
+        for (Class<?> type = entity.getClass(); type != null; type = type.getSuperclass()) {
+            String name = type.getName();
+            if (name.contains("PlayerEntity") || name.endsWith(".Player") || name.endsWith(".class_1657")) {
+                return NametagTarget.Kind.PLAYER;
+            }
+            if (name.contains("ItemEntity") || name.endsWith(".ItemEntity") || name.endsWith(".class_1542")) {
+                return NametagTarget.Kind.ITEM;
+            }
+            if (name.contains("HostileEntity") || name.endsWith(".Monster") || name.endsWith(".class_1588")) {
+                return NametagTarget.Kind.HOSTILE;
+            }
+            if (name.contains("AnimalEntity") || name.endsWith(".Animal") || name.endsWith(".class_1429")) {
+                return NametagTarget.Kind.PASSIVE;
+            }
+        }
+        return NametagTarget.Kind.OTHER;
+    }
+
+    private static int itemCount(Object entity) {
+        Object stack = invokeNoArgs(entity, "getStack", "getItem", "method_6983", "m_32055_").orElse(null);
+        if (stack == null) return 0;
+        return getNumberCompatible(stack, List.of("getCount", "method_7947", "m_41613_")).orElse(0.0D).intValue();
+    }
+
+    private static Object playerInfo(Object client, Object player) {
+        Object handler = invokeNoArgs(client, "getNetworkHandler", "getConnection", "method_1562").orElse(null);
+        if (handler == null) return null;
+        Object uuid = invokeNoArgs(player, "getUuid", "getUUID", "method_5667", "m_20148_").orElse(null);
+        if (uuid == null) return null;
+        return invokeCompatible(handler, List.of("getPlayerListEntry", "getPlayerInfo", "method_2871", "m_10454_"), uuid)
+                .orElse(null);
+    }
+
+    private static int playerPing(Object client, Object player) {
+        Object info = playerInfo(client, player);
+        if (info == null) return -1;
+        return getNumberCompatible(info, List.of("getLatency", "getResponseTime", "method_2959", "m_10502_"))
+                .orElse(-1.0D).intValue();
+    }
+
+    private static int playerPing(Object info) {
+        if (info == null) return -1;
+        return getNumberCompatible(info, List.of("getLatency", "getResponseTime", "method_2959", "m_10502_"))
+                .orElse(-1.0D).intValue();
+    }
+
+    private static String playerGameMode(Object client, Object player) {
+        Object info = playerInfo(client, player);
+        Object mode = info == null ? null : invokeNoArgs(info, "getGameMode", "method_2958", "m_10503_").orElse(null);
+        if (!(mode instanceof Enum<?> value)) return "BOT";
+        return switch (value.name()) {
+            case "SPECTATOR" -> "Sp";
+            case "CREATIVE" -> "C";
+            case "ADVENTURE" -> "A";
+            default -> "S";
+        };
+    }
+
+    private static String playerGameMode(Object info) {
+        Object mode = info == null ? null : invokeNoArgs(info, "getGameMode", "method_2958", "m_10503_").orElse(null);
+        if (!(mode instanceof Enum<?> value)) return "BOT";
+        return switch (value.name()) {
+            case "SPECTATOR" -> "Sp";
+            case "CREATIVE" -> "C";
+            case "ADVENTURE" -> "A";
+            default -> "S";
+        };
+    }
+
     private static boolean screenOpen(Object client) throws IllegalAccessException {
         return readField(client, "currentScreen", "screen", "field_1755", "y", "f_91080_").isPresent();
     }
 
     private static double mouseSensitivity(Object client) throws IllegalAccessException {
-        Object options = readField(client, "options", "gameOptions", "field_1690", "m", "f_91066_").orElse(null);
+        Object options = readField(client, "options", "gameOptions", "field_1690", "k", "m", "f_91066_").orElse(null);
         if (options == null) {
             return 0.5D;
         }
@@ -3015,6 +3591,35 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
 
     private static Optional<Double> z(Object entity) {
         return getNumberCompatible(entity, List.of("getZ", "method_23321", "m_20189_"));
+    }
+
+    private static Optional<Vec3> position(Object entity) {
+        Optional<Double> x = x(entity);
+        Optional<Double> y = y(entity);
+        Optional<Double> z = z(entity);
+        return x.isPresent() && y.isPresent() && z.isPresent()
+                ? Optional.of(new Vec3(x.get(), y.get(), z.get())) : Optional.empty();
+    }
+
+    private static Vec3 previousPosition(Object entity, Vec3 fallback) {
+        return new Vec3(prevX(entity).orElse(fallback.x()), prevY(entity).orElse(fallback.y()),
+                prevZ(entity).orElse(fallback.z()));
+    }
+
+    private static Vec3 interpolate(Vec3 previous, Vec3 current, float tickDelta) {
+        return new Vec3(lerp(tickDelta, previous.x(), current.x()),
+                lerp(tickDelta, previous.y(), current.y()),
+                lerp(tickDelta, previous.z(), current.z()));
+    }
+
+    private static Optional<Long> entityTick(Object entity) {
+        try {
+            return readField(entity, ENTITY_TICK_FIELD_NAMES.toArray(String[]::new))
+                    .filter(Number.class::isInstance)
+                    .map(value -> ((Number) value).longValue());
+        } catch (IllegalAccessException ignored) {
+            return Optional.empty();
+        }
     }
 
     private static Vec3 velocity(Object entity) {
@@ -3181,6 +3786,14 @@ public final class ReflectionMinecraftBridge implements MinecraftBridge {
             }
         }
         return Optional.empty();
+    }
+
+    private Optional<Object> minecraftClientFast() {
+        Object cached = cachedMinecraftClient;
+        if (cached != null) return Optional.of(cached);
+        Optional<Object> resolved = minecraftClient();
+        resolved.ifPresent(client -> cachedMinecraftClient = client);
+        return resolved;
     }
 
     private static Optional<Object> minecraftClient() {

@@ -129,4 +129,26 @@ public abstract class AbstractModule implements ClientModule {
         settings.add(setting);
         return setting;
     }
+
+    /** A launcher for a module-specific entity type selector. */
+    protected ModuleSetting entityListSetting(String id, String displayName, String description) {
+        ModuleSetting setting = new ModuleSetting(id, displayName, ModuleSetting.Kind.ENTITY_LIST,
+                java.util.List.of(), 0.0D, 0.0D, 0.0D, 1.0D).description(description);
+        settings.add(setting);
+        return setting;
+    }
+
+    /** A compact multi-select entity picker encoded as an option bit mask. */
+    protected ModuleSetting entityListSetting(String id, String displayName, String description,
+                                              java.util.List<String> options, int defaultMask) {
+        if (options.isEmpty() || options.size() > 30) {
+            throw new IllegalArgumentException("entity options must contain between 1 and 30 entries");
+        }
+        int maxMask = (1 << options.size()) - 1;
+        ModuleSetting setting = new ModuleSetting(id, displayName, ModuleSetting.Kind.ENTITY_LIST,
+                options, defaultMask & maxMask, 0, maxMask, 1).description(description);
+        settings.add(setting);
+        return setting;
+    }
+
 }

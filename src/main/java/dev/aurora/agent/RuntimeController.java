@@ -15,6 +15,7 @@ import dev.aurora.injector.IpcMessage;
 import dev.aurora.injector.ModuleUpdate;
 import dev.aurora.input.RealClickSimulator;
 import dev.aurora.input.ActivationClickSuppressor;
+import dev.aurora.input.GameplayInputGate;
 import dev.aurora.minecraft.MinecraftBridge;
 import dev.aurora.minecraft.ReflectionMinecraftBridge;
 import dev.aurora.modules.AimAssistModule;
@@ -29,9 +30,13 @@ import dev.aurora.modules.FreecamModule;
 import dev.aurora.modules.FullbrightModule;
 import dev.aurora.modules.HitSwapModule;
 import dev.aurora.modules.JumpResetModule;
+import dev.aurora.modules.InstantStopModule;
 import dev.aurora.modules.KnockbackDelayModule;
 import dev.aurora.modules.NoJumpDelayModule;
+import dev.aurora.modules.AntiDebuffModule;
+import dev.aurora.modules.PanicModule;
 import dev.aurora.modules.NetworkDelayModule;
+import dev.aurora.modules.NametagsModule;
 import dev.aurora.modules.ReachModule;
 import dev.aurora.modules.TrajectoriesModule;
 import dev.aurora.modules.SilentAuraModule;
@@ -44,10 +49,12 @@ import dev.aurora.network.KnockbackPackets;
 import dev.aurora.network.PacketRelay;
 import dev.aurora.social.FriendManager;
 import dev.aurora.render.WorldGeometryBatch;
+import dev.aurora.render.FrostedToastRenderer;
 import dev.aurora.render.SilentAimCrosshairIndicator;
 import dev.aurora.util.Json;
 
 import java.lang.instrument.Instrumentation;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -55,6 +62,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -76,6 +84,8 @@ public final class RuntimeController {
     private final PacketRelay packetRelay = PacketRelay.get();
     private final AtomicBoolean uninstalled = new AtomicBoolean();
     private final AtomicBoolean moduleStateChangedOffTick = new AtomicBoolean();
+    /** Work received from the control panel that must interact with Minecraft on its client thread. */
+    private final ConcurrentLinkedQueue<Runnable> pendingClientThreadTasks = new ConcurrentLinkedQueue<>();
     private final Map<String, Boolean> moduleKeyStates = new HashMap<>();
     private final ScheduledExecutorService hookWatchdog = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "aurora-hook-watchdog");
@@ -95,12 +105,18 @@ public final class RuntimeController {
     private volatile boolean deadWorldRenderHookLogged;
     private final ClientConfig config = ClientConfig.standard();
     private final HitSwapModule hitSwap;
+    private final AntiDebuffModule antiDebuff;
     private volatile String lastSavedFingerprint = "";
     private volatile boolean silentAimCrosshairIndicator = true;
+    private final FrostedToastRenderer toastRenderer;
+    private final Map<String, Boolean> notifiedModuleStates = new HashMap<>();
+    private int notificationDurationMillis = 1_500;
+    private boolean notificationsEnabled = true;
 
     private RuntimeController(IpcAgentClient ipc, String minecraftVersion) {
         this.ipc = ipc;
         this.minecraft = new ReflectionMinecraftBridge(message -> ipc.log("ERROR", message));
+        this.toastRenderer = new FrostedToastRenderer(minecraft);
         this.hooks = new HookInstaller(HookProfile.forVersion(minecraftVersion),
                 message -> ipc.log("ERROR", message));
         this.modules = new ModuleManager(message -> ipc.log("ERROR", message));
@@ -120,6 +136,7 @@ public final class RuntimeController {
         modules.register(triggerBot);
         modules.register(new KnockbackDelayModule(minecraft, knockbackPackets, packetRelay));
         modules.register(new JumpResetModule(minecraft, knockbackPackets));
+        modules.register(new InstantStopModule(minecraft));
         modules.register(new NoJumpDelayModule(minecraft));
         hitSwap = new HitSwapModule(minecraft);
         modules.register(hitSwap);
@@ -130,7 +147,10 @@ public final class RuntimeController {
         modules.register(trajectories);
         modules.register(new EspModule(minecraft, trajectories::currentHitEntityId));
         modules.register(new TracersModule(minecraft));
+        modules.register(new NametagsModule(minecraft));
         modules.register(new FullbrightModule(minecraft));
+        antiDebuff = new AntiDebuffModule();
+        modules.register(antiDebuff);
         freeLook = new FreeLookModule(minecraft);
         modules.register(freeLook);
         freecam = new FreecamModule(minecraft);
@@ -140,7 +160,11 @@ public final class RuntimeController {
         modules.register(new NetworkDelayModule(packetRelay));
         modules.register(new BlinkModule(minecraft, packetRelay, () -> moduleStateChangedOffTick.set(true)));
         modules.register(new TextGuiModule(minecraft, modules::modules));
+        modules.register(new PanicModule(modules));
         config.applyTo(modules, message -> ipc.log("WARN", message));
+        for (ClientModule module : modules.modules()) {
+            notifiedModuleStates.put(module.id(), module.enabled());
+        }
         lastSavedFingerprint = moduleStateFingerprint();
     }
 
@@ -165,6 +189,11 @@ public final class RuntimeController {
         return instance;
     }
 
+    void publishInitialState() {
+        publishModules();
+        publishStatus("Agent active");
+    }
+
     public void handleIpc(IpcMessage message) {
         if (message.type() == IpcMessage.Type.DETACH) {
             uninstall();
@@ -172,15 +201,25 @@ public final class RuntimeController {
         }
         if (message.type() == IpcMessage.Type.MODULE_UPDATE) {
             ModuleUpdate update = ModuleUpdate.fromJson(message.payload());
-            if (update.id() != null && modules.update(update.id(), update.enabled(), update.keybind(), update.settings())) {
-                publishModules();
-                publishStatus("Updated module " + update.id());
-                saveConfigIfChanged();
+            if (update.id() != null) {
+                // IPC callbacks run on the connection thread. Module lifecycle methods can touch
+                // Minecraft options (Fullbright, for example), so apply them during the next
+                // client tick instead of mutating game state from that background thread.
+                pendingClientThreadTasks.add(() -> applyModuleUpdate(update));
             }
         }
         if (message.type() == IpcMessage.Type.GLOBAL_SETTINGS) {
             silentAimCrosshairIndicator = Json.booleanField(
                     message.payload(), "silentAimCrosshairIndicator", silentAimCrosshairIndicator);
+            notificationsEnabled = Json.booleanField(
+                    message.payload(), "notificationsEnabled", notificationsEnabled);
+            if (!notificationsEnabled) toastRenderer.dismissImmediately();
+            int radius = numberSetting(message.payload(), "notificationRadius", 18, 8, 28);
+            int blur = numberSetting(message.payload(), "notificationBlur", 4, 4, 40);
+            int opacity = numberSetting(message.payload(), "notificationOpacity", 35, 0, 100);
+            notificationDurationMillis = numberSetting(message.payload(), "notificationDurationMillis",
+                    notificationDurationMillis, 500, 5_000);
+            toastRenderer.configure(radius, blur, opacity);
         }
         if (message.type() == IpcMessage.Type.FRIENDS) {
             applyFriends(message.payload());
@@ -209,6 +248,7 @@ public final class RuntimeController {
         }
         packetRelay.reset();
         ActivationClickSuppressor.clear();
+        GameplayInputGate.clear();
         hookWatchdog.shutdownNow();
         hooks.uninstall();
         HookDispatch.unbind();
@@ -230,10 +270,14 @@ public final class RuntimeController {
         long count = ticks.incrementAndGet();
         boolean stateChangedOffTick = moduleStateChangedOffTick.getAndSet(false);
         packetRelay.onTick();
+        if (GameplayInputGate.isActive()) {
+            minecraft.suppressClickGuiGameplayInput();
+        }
         ActivationClickSuppressor.armIfAttackKeyHeld(
                 silentAura.suppressPhysicalHeldAttack()
                         || triggerBot.suppressPhysicalHeldAttack());
         String before = moduleStateFingerprint();
+        drainClientThreadTasks();
         processModuleKeybinds();
         modules.onTick(TickEvent.now());
         if (stateChangedOffTick || !before.equals(moduleStateFingerprint())) {
@@ -245,12 +289,47 @@ public final class RuntimeController {
         }
     }
 
+    private void applyModuleUpdate(ModuleUpdate update) {
+        boolean updated = modules.update(update.id(), update.enabled(), update.keybind(), update.settings());
+        publishModules();
+        publishStatus((updated ? "Updated module " : "Rejected update for module ") + update.id());
+        if (updated) {
+            saveConfigIfChanged();
+        }
+    }
+
+    private void drainClientThreadTasks() {
+        Runnable task;
+        while ((task = pendingClientThreadTasks.poll()) != null) {
+            task.run();
+        }
+    }
+
     public boolean onAttackAttempt() {
+        if (GameplayInputGate.isActive()) {
+            return true;
+        }
+        // A detached camera must never turn the player's server-side crosshair into an invisible
+        // interaction cursor. The server still evaluates attacks from the stationary body, which
+        // otherwise allows Freecam to hit entities that are behind or outside the rendered view.
+        if (freecam.enabled() && freecam.state().isActive()) {
+            return true;
+        }
         if (ActivationClickSuppressor.shouldSuppressAttack()) {
             return true;
         }
         hitSwap.onAttackAttempt();
         return false;
+    }
+
+    public boolean antiDebuffEnabled() {
+        return antiDebuff.enabled();
+    }
+
+    public boolean onBlockAttackAttempt() {
+        return GameplayInputGate.isActive()
+                || (freecam.enabled() && freecam.state().isActive())
+                || ActivationClickSuppressor.shouldSuppressAttack();
     }
 
     private void saveConfigIfChanged() {
@@ -263,8 +342,12 @@ public final class RuntimeController {
     }
 
     private void processModuleKeybinds() {
-        boolean inputBlocked = minecraft.hasOpenScreen();
+        boolean inputBlocked = minecraft.hasOpenScreen() || GameplayInputGate.isActive();
         for (ClientModule module : modules.modules()) {
+            if (isPanicActive() && !"panic".equals(module.id())) {
+                moduleKeyStates.put(module.id(), false);
+                continue;
+            }
             int keybind = module.keybind();
             boolean down = keybind >= 0 && minecraft.isKeyDown(keybind);
             boolean wasDown = moduleKeyStates.getOrDefault(module.id(), false);
@@ -283,8 +366,14 @@ public final class RuntimeController {
         }
     }
 
+    private boolean isPanicActive() {
+        return modules.find("panic").map(ClientModule::enabled).orElse(false);
+    }
+
     public void onRender(Object context) {
         renders.incrementAndGet();
+        minecraft.beginHudFrame(context);
+        showModuleStateNotification();
         modules.onRender(RenderEvent.now(context));
         SilentAimSystem silentAim = SilentAimSystem.get();
         DecoupledAimState decoupled = DecoupledAimState.get();
@@ -292,6 +381,24 @@ public final class RuntimeController {
             SilentAimCrosshairIndicator.render(minecraft, context, decoupled.visualAngles(),
                     new AimAngles(silentAim.lastSilentYaw(), silentAim.lastSilentPitch()));
         }
+        toastRenderer.render(context, Instant.now());
+    }
+
+    private void showModuleStateNotification() {
+        for (ClientModule module : modules.modules()) {
+            boolean enabled = module.enabled();
+            Boolean previous = notifiedModuleStates.put(module.id(), enabled);
+            if (notificationsEnabled && previous != null && previous != enabled) {
+                toastRenderer.show(module.displayName(), enabled ? "Enabled" : "Disabled",
+                        Duration.ofMillis(notificationDurationMillis));
+            }
+        }
+    }
+
+    private static int numberSetting(String json, String name, int fallback, int minimum, int maximum) {
+        Double value = Json.numberField(json, name);
+        int number = value == null ? fallback : (int) Math.round(value);
+        return Math.max(minimum, Math.min(maximum, number));
     }
 
     public void onWorldRender(Object matrixStack, Object vertexConsumers) {
@@ -302,6 +409,13 @@ public final class RuntimeController {
             worldRenderFlushFailures.incrementAndGet();
         }
     }
+
+    /** Captures Minecraft's intact world model-view matrix before its entity pass mutates and pops
+     * the supplied stack. HUD projection later in the frame uses this immutable snapshot. */
+    public void captureWorldProjection(Object matrixStack) {
+        minecraft.captureWorldProjection(matrixStack);
+    }
+
 
     /** Returns whether {@code packet} should be suppressed (held back by {@link PacketRelay} for
      * later replay) instead of actually being sent/received this call. */
@@ -373,8 +487,15 @@ public final class RuntimeController {
         FreeCameraState detached = activeDetachedCamera();
         if (detached != null) {
             // Restore the body to its frozen angle (current and previous tick) so movement, hitboxes
-            // and the rendered model stay put, then point the render camera at the free view and (for
-            // Freecam) relocate it to the interpolated free-flying position.
+            // and the rendered model stay put. A non-decoupled silent aim owns the body rotation,
+            // however, so retain its latest rotation instead of overwriting it with the angle Free
+            // Look captured on activation. The detached camera view remains independent.
+            SilentAimSystem silentAim = SilentAimSystem.get();
+            if (silentAim.hasActiveSilentAim() && !DecoupledAimState.get().isActive()) {
+                detached.updateBodyAngles(new AimAngles(silentAim.lastSilentYaw(), silentAim.lastSilentPitch()));
+            }
+            // Then point the render camera at the free view and (for Freecam) relocate it to the
+            // interpolated free-flying position.
             AimAngles body = detached.bodyAngles();
             minecraft.applyCameraEntityRotation(focusedEntity, body.yaw(), body.pitch());
             AimAngles view = detached.viewAngles();
@@ -402,6 +523,10 @@ public final class RuntimeController {
     }
 
     public void onMovementInput(Object input) {
+        if (GameplayInputGate.isActive()) {
+            minecraft.freezeMovementInput(input);
+            return;
+        }
         FreeCameraState detached = activeDetachedCamera();
         if (detached != null && detached.freezeMovement()) {
             // Freecam: keep the body stationary while the detached camera flies.
@@ -441,6 +566,7 @@ public final class RuntimeController {
         payload.put("description", module.description());
         payload.put("enabled", module.enabled());
         payload.put("keybind", module.keybind());
+        payload.put("requiresKeybind", module.requiresKeybind());
         payload.put("settings", new Json.Raw(Json.array(module.settings().stream()
                 .map(this::settingJson)
                 .map(Json.Raw::new)

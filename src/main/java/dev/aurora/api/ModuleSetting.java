@@ -101,6 +101,7 @@ public final class ModuleSetting {
         NUMBER,
         BOOLEAN,
         OPTION,
-        COLOR
+        COLOR,
+        ENTITY_LIST
     }
 }

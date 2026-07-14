@@ -31,7 +31,7 @@ public final class KnockbackDelayModule extends AbstractModule {
 
     public KnockbackDelayModule(MinecraftBridge minecraft, KnockbackPackets knockbackPackets,
                                 PacketRelay relay) {
-        super("knockback-delay", "Knockback Delay", "Combat",
+        super("knockback-delay", "Knockback Delay", "Network",
                 "Delays incoming knockback briefly when fighting a player near the crosshair.");
         this.minecraft = Objects.requireNonNull(minecraft, "minecraft");
         this.knockbackPackets = Objects.requireNonNull(knockbackPackets, "knockbackPackets");

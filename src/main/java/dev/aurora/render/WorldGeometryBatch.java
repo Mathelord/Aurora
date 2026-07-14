@@ -93,15 +93,23 @@ public final class WorldGeometryBatch {
         return lines.size();
     }
 
+    /**
+     * Submits the accumulated primitives once and releases their entity/position references.
+     * Additional primitives may be accumulated and flushed again, but an unchanged second flush is
+     * a cheap no-op instead of rendering the previous frame's geometry twice.
+     */
     public boolean flush() {
-        boolean ok = true;
-        if (!quads.isEmpty() || !lines.isEmpty()) {
-            ok = ReflectionWorldGeometry.draw(matrixStack, vertexConsumers, camera, quads, lines);
+        if (quads.isEmpty() && lines.isEmpty() && wallhackQuads.isEmpty()) {
+            return true;
         }
-        if (!wallhackQuads.isEmpty()) {
-            ok = ReflectionWorldGeometry.drawThroughWalls(matrixStack, vertexConsumers, camera, wallhackQuads) && ok;
+        try {
+            return ReflectionWorldGeometry.draw(
+                    matrixStack, vertexConsumers, camera, quads, lines, wallhackQuads);
+        } finally {
+            quads.clear();
+            lines.clear();
+            wallhackQuads.clear();
         }
-        return ok;
     }
 
     private boolean available() {

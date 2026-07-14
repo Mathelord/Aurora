@@ -12,6 +12,7 @@ public final class HookDispatch {
     static final String TICK_CALLBACK_KEY = "dev.aurora.hook.tick";
     static final String RENDER_CALLBACK_KEY = "dev.aurora.hook.render";
     static final String WORLD_RENDER_CALLBACK_KEY = "dev.aurora.hook.render.world";
+    static final String WORLD_PROJECTION_CALLBACK_KEY = "dev.aurora.hook.render.world.projection";
     static final String INBOUND_PACKET_CALLBACK_KEY = "dev.aurora.hook.packet.inbound";
     static final String OUTBOUND_PACKET_CALLBACK_KEY = "dev.aurora.hook.packet.outbound";
     static final String CLICK_GUI_OPEN_KEY = "dev.aurora.gui.open";
@@ -22,6 +23,7 @@ public final class HookDispatch {
     static final String MOVEMENT_CALLBACK_KEY = "dev.aurora.hook.movement";
     static final String ATTACK_SUPPRESSION_CALLBACK_KEY = "dev.aurora.hook.attack.suppress";
     static final String BLOCK_ATTACK_SUPPRESSION_CALLBACK_KEY = "dev.aurora.hook.block-attack.suppress";
+    static final String ANTI_DEBUFF_CALLBACK_KEY = "dev.aurora.hook.anti-debuff";
 
     private HookDispatch() {
     }
@@ -34,6 +36,9 @@ public final class HookDispatch {
         });
         System.getProperties().put(WORLD_RENDER_CALLBACK_KEY, (Consumer<Object[]>) arguments ->
                 controller.onWorldRender(arguments[0], arguments[1]));
+        System.getProperties().put(WORLD_PROJECTION_CALLBACK_KEY, (Consumer<Object[]>) arguments -> {
+            if (arguments != null && arguments.length > 0) controller.captureWorldProjection(arguments[0]);
+        });
         // Packet callbacks return true to suppress the original send/receive call (the packet is
         // being held by PacketRelay for later replay); false lets it proceed normally.
         System.getProperties().put(INBOUND_PACKET_CALLBACK_KEY, (BiPredicate<Object, Object>) (listener, packet) ->
@@ -50,13 +55,15 @@ public final class HookDispatch {
         System.getProperties().put(ATTACK_SUPPRESSION_CALLBACK_KEY,
                 (BooleanSupplier) controller::onAttackAttempt);
         System.getProperties().put(BLOCK_ATTACK_SUPPRESSION_CALLBACK_KEY,
-                (BooleanSupplier) ActivationClickSuppressor::shouldSuppressAttack);
+                (BooleanSupplier) controller::onBlockAttackAttempt);
+        System.getProperties().put(ANTI_DEBUFF_CALLBACK_KEY, (BooleanSupplier) controller::antiDebuffEnabled);
     }
 
     static void unbind() {
         System.getProperties().remove(TICK_CALLBACK_KEY);
         System.getProperties().remove(RENDER_CALLBACK_KEY);
         System.getProperties().remove(WORLD_RENDER_CALLBACK_KEY);
+        System.getProperties().remove(WORLD_PROJECTION_CALLBACK_KEY);
         System.getProperties().remove(INBOUND_PACKET_CALLBACK_KEY);
         System.getProperties().remove(OUTBOUND_PACKET_CALLBACK_KEY);
         System.getProperties().remove(CLICK_GUI_OPEN_KEY);
@@ -67,5 +74,6 @@ public final class HookDispatch {
         System.getProperties().remove(MOVEMENT_CALLBACK_KEY);
         System.getProperties().remove(ATTACK_SUPPRESSION_CALLBACK_KEY);
         System.getProperties().remove(BLOCK_ATTACK_SUPPRESSION_CALLBACK_KEY);
+        System.getProperties().remove(ANTI_DEBUFF_CALLBACK_KEY);
     }
 }

@@ -39,16 +39,13 @@ class PacketRelayTest {
     }
 
     @Test
-    void protocolCriticalRequestsBypassInboundDelay() {
+    void latencyMeasurementPacketsAreHeldWithTheInboundStream() {
         relay.request("owner-a", 5000, 5000);
         FakeListener listener = new FakeListener();
 
-        assertFalse(relay.captureInbound(listener, new net.minecraft.class_2670()));
-        assertFalse(relay.captureInbound(listener, new net.minecraft.class_6373()));
-        assertEquals(0, relay.heldInboundCount());
-
-        assertTrue(relay.captureInbound(listener, new FakePacket()));
-        assertEquals(1, relay.heldInboundCount());
+        assertTrue(relay.captureInbound(listener, new net.minecraft.class_2670()));
+        assertTrue(relay.captureInbound(listener, new net.minecraft.class_6373()));
+        assertEquals(2, relay.heldInboundCount());
     }
 
     @Test

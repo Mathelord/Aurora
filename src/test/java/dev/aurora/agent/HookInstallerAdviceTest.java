@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import dev.aurora.input.GameplayInputGate;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -22,12 +23,22 @@ class HookInstallerAdviceTest {
 
     @AfterEach
     void removeCallbacks() {
+        GameplayInputGate.clear();
         System.getProperties().remove(HookDispatch.TICK_CALLBACK_KEY);
         System.getProperties().remove(HookDispatch.RENDER_CALLBACK_KEY);
         System.getProperties().remove(HookDispatch.WORLD_RENDER_CALLBACK_KEY);
         System.getProperties().remove(HookDispatch.CLICK_GUI_OPEN_KEY);
         System.getProperties().remove(HookDispatch.OUTBOUND_PACKET_CALLBACK_KEY);
         System.getProperties().remove(HookDispatch.INBOUND_PACKET_CALLBACK_KEY);
+    }
+
+    @Test
+    void inputAdvicesSuppressKeyboardMouseAndScrollWhileTheGateIsHeld() {
+        assertTrue(GameplayInputGate.acquire("test"));
+
+        assertTrue(HookInstaller.MouseButtonAdvice.onEnter());
+        assertTrue(HookInstaller.MouseScrollAdvice.onEnter(1.0D));
+        assertTrue(HookInstaller.KeyboardAdvice.onEnter());
     }
 
     @Test

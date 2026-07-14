@@ -20,10 +20,10 @@ public final class NetworkDelayModule extends AbstractModule {
 
     public NetworkDelayModule(PacketRelay relay) {
         super("network-delay", "Network Delay", "Network",
-                "Delays gameplay traffic while allowing required keep-alive responses through.");
+                "Delays the complete inbound stream so the server observes the added latency.");
         this.relay = Objects.requireNonNull(relay, "relay");
         latencyMs = setting("latency-ms", "Delay ms", 150.0D, 25.0D, 2_000.0D, 25.0D)
-                .description("Time gameplay packets are held; keep-alive and transaction pings bypass the delay.");
+                .description("Time all inbound packets are held, including keep-alive and transaction pings.");
     }
 
     @Override

@@ -11,6 +11,7 @@ import dev.aurora.minecraft.CameraPose;
 import dev.aurora.minecraft.MinecraftBridge;
 import dev.aurora.minecraft.TargetPose;
 import dev.aurora.render.WorldGeometryBatch;
+import dev.aurora.social.FriendManager;
 
 import java.util.Objects;
 import java.util.Optional;
@@ -28,6 +29,7 @@ public final class TracersModule extends AbstractModule {
     private final MinecraftBridge minecraft;
     private final ModuleSetting range;
     private final ModuleSetting color;
+    private final ModuleSetting friendColor;
     private final ModuleSetting thickness;
     private final ModuleSetting outline;
     private final ModuleSetting outlineColor;
@@ -39,6 +41,8 @@ public final class TracersModule extends AbstractModule {
                 .description("Maximum distance at which to draw a tracer line.");
         this.color = colorSetting("color", "Color", 0xFFE664)
                 .description("Color of the tracer lines.");
+        this.friendColor = colorSetting("friend-color", "Friend Color", 0x64C8FF)
+                .description("Color of tracer lines to friended players.");
         this.thickness = setting("thickness", "Thickness", 0.02D, 0.002D, 0.3D, 0.002D)
                 .description("World-space thickness, in blocks, of each tracer line.");
         this.outline = booleanSetting("outline", "Outline", true)
@@ -65,6 +69,7 @@ public final class TracersModule extends AbstractModule {
                 .direction().multiply(ORIGIN_FORWARD_OFFSET));
 
         int lineColor = colorArgb(color);
+        int friendLineColor = colorArgb(friendColor);
         boolean drawOutline = enabled(outline);
         int borderColor = colorArgb(outlineColor);
         double halfThickness = thickness.value() / 2.0D;
@@ -74,6 +79,14 @@ public final class TracersModule extends AbstractModule {
             if (target != null) {
                 renderTracer(event.geometry(), origin, camera.eye(), target,
                         lineColor, drawOutline, borderColor, halfThickness, outlineHalfThickness);
+            }
+        }
+        // Friends are excluded from the normal aim context, so render their tracers separately
+        // while keeping them out of the combat target list.
+        for (AimTarget friend : minecraft.friendTargets(range.value())) {
+            if (friend != null) {
+                renderTracer(event.geometry(), origin, camera.eye(), friend,
+                        friendLineColor, drawOutline, borderColor, halfThickness, outlineHalfThickness);
             }
         }
     }
